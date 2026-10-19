@@ -1,0 +1,11 @@
+[project]
+name = "fin-validate"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "validate.fin"
+
+[packages]
+
+[scripts]
+check = "finc src/validate.fin"
+test = "finc tests/test_validate.fin -I src -o test_validate && ./test_validate"

@@ -1,0 +1,126 @@
+// fin-validate test suite.
+//
+// Run: finc tests/test_validate.fin -I src -o test_validate && ./test_validate
+// (from the repo root).
+
+import { new_schema, add_string_field, add_email_field, add_int_field, add_float_field, add_bool_field, add_one_of_field, add_custom_field, new_input, input_set, schema_check, error_count, error_at, Schema, ValidationResult, ValidationError } from validate::fin;
+import { Collection } from collection::std;
+import { assert_true } from testing::std;
+import { equals, len } from strings::std;
+
+fun signup_schema() <Schema> {
+    let s <Schema> = new_schema();
+    add_string_field(&s, "username", true, 3, 20);
+    add_email_field(&s, "email", true);
+    add_int_field(&s, "age", false, true, 0.0, true, 150.0);
+    add_float_field(&s, "height", false, true, 0.5, true, 2.8);
+    add_bool_field(&s, "newsletter", false);
+    let roles <&Collection<string>> = new Collection::<string>{};
+    roles.push("admin");
+    roles.push("user");
+    add_one_of_field(&s, "role", true, roles);
+    let even <fn(string) -> bool> = (v: string) <bool> => len(v) % 2 == 0;
+    add_custom_field(&s, "code", false, even, "code must have even length");
+    return s;
+}
+
+fun valid_input() <&Collection<InputValue>> {
+    let in <&Collection<InputValue>> = new_input();
+    input_set(in, "username", "eleanor_1");
+    input_set(in, "email", "eleanor@example.com");
+    input_set(in, "age", "27");
+    input_set(in, "height", "1.68");
+    input_set(in, "newsletter", "true");
+    input_set(in, "role", "admin");
+    input_set(in, "code", "abcd");
+    return in;
+}
+
+fun main() <noret> {
+    let s <Schema> = signup_schema();
+
+    // 1. fully valid input
+    let r1 <ValidationResult> = schema_check(&s, valid_input());
+    assert_true(r1.ok, "valid input should pass");
+    assert_true(error_count(&r1) == 0, "valid input: no errors");
+
+    // 2. missing required field
+    let i2 <&Collection<InputValue>> = new_input();
+    input_set(i2, "email", "eleanor@example.com");
+    input_set(i2, "role", "user");
+    let r2 <ValidationResult> = schema_check(&s, i2);
+    assert_true(!r2.ok, "missing username should fail");
+    assert_true(error_count(&r2) == 1, "missing username: exactly 1 error");
+    let e2 <ValidationError> = error_at(&r2, 0);
+    assert_true(equals(e2.field, "username"), "error is on username");
+    assert_true(equals(e2.message, "field 'username' is required"), "required message");
+
+    // 3. bad email
+    let i3 <&Collection<InputValue>> = valid_input();
+    input_set(i3, "email", "not-an-email");
+    let r3 <ValidationResult> = schema_check(&s, i3);
+    assert_true(!r3.ok, "bad email should fail");
+    assert_true(equals(error_at(&r3, 0).message, "field 'email' is not a valid email address"), "email message");
+
+    // 4. age above maximum
+    let i4 <&Collection<InputValue>> = valid_input();
+    input_set(i4, "age", "999");
+    let r4 <ValidationResult> = schema_check(&s, i4);
+    assert_true(!r4.ok, "age 999 should fail");
+    assert_true(equals(error_at(&r4, 0).message, "field 'age' is above the maximum"), "max message");
+
+    // 5. age not a number
+    let i5 <&Collection<InputValue>> = valid_input();
+    input_set(i5, "age", "abc");
+    let r5 <ValidationResult> = schema_check(&s, i5);
+    assert_true(!r5.ok, "age 'abc' should fail");
+    assert_true(equals(error_at(&r5, 0).message, "field 'age' must be an integer"), "int message");
+
+    // 6. integer overflow must NOT abort — it is a validation error
+    let i6 <&Collection<InputValue>> = valid_input();
+    input_set(i6, "age", "2147483648");
+    let r6 <ValidationResult> = schema_check(&s, i6);
+    assert_true(!r6.ok, "age overflow should fail gracefully");
+    assert_true(equals(error_at(&r6, 0).message, "field 'age' must be an integer"), "overflow message");
+
+    // 7. disallowed role
+    let i7 <&Collection<InputValue>> = valid_input();
+    input_set(i7, "role", "superuser");
+    let r7 <ValidationResult> = schema_check(&s, i7);
+    assert_true(!r7.ok, "bad role should fail");
+    assert_true(equals(error_at(&r7, 0).message, "field 'role' is not an allowed value"), "one_of message");
+
+    // 8. username too short
+    let i8 <&Collection<InputValue>> = valid_input();
+    input_set(i8, "username", "ab");
+    let r8 <ValidationResult> = schema_check(&s, i8);
+    assert_true(!r8.ok, "short username should fail");
+    assert_true(equals(error_at(&r8, 0).message, "field 'username' is too short"), "min_len message");
+
+    // 9. custom validator rejects odd-length code
+    let i9 <&Collection<InputValue>> = valid_input();
+    input_set(i9, "code", "abc");
+    let r9 <ValidationResult> = schema_check(&s, i9);
+    assert_true(!r9.ok, "odd code should fail custom check");
+    assert_true(equals(error_at(&r9, 0).message, "code must have even length"), "custom message");
+
+    // 10. bad float + bad bool
+    let i10 <&Collection<InputValue>> = valid_input();
+    input_set(i10, "height", "tall");
+    input_set(i10, "newsletter", "maybe");
+    let r10 <ValidationResult> = schema_check(&s, i10);
+    assert_true(!r10.ok, "bad float/bool should fail");
+    assert_true(error_count(&r10) == 2, "two errors expected");
+
+    // 11. dotted nested field names
+    let ns <Schema> = new_schema();
+    add_string_field(&ns, "address.city", true, 1, 60);
+    add_int_field(&ns, "address.zip", true, false, 0.0, false, 0.0);
+    let ni <&Collection<InputValue>> = new_input();
+    input_set(ni, "address.city", "Isfahan");
+    input_set(ni, "address.zip", "81398");
+    let nr <ValidationResult> = schema_check(&ns, ni);
+    assert_true(nr.ok, "nested dotted fields should pass");
+
+    printf("all fin-validate tests passed\n");
+}
