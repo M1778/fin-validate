@@ -4,9 +4,14 @@ Schema-driven input validation for [Fin](https://github.com/M1778/Fin). Validate
 
 ## Verification status
 
-> **UNVERIFIED.** This library is written against `docs/agent-guide.md` (Fin v0.4.0)
-> but no `finc` binary was available when it was written, so it has not been
-> type-checked or executed yet. See [test plan](#testing).
+**VERIFIED 2026-10-20** — built and executed with finc 0.4.0 (contract 3).
+`tests/test_validate.fin` passes: required/email/int/float/bool rules,
+length and numeric ranges, allowed lists, custom validators, nested dotted
+names, error messages. (This run fixed several finc-0.4.0 incompatibilities:
+`in` is now a keyword, structs need `#[export]`+`pub:`, enum-typed struct
+fields do not lower, struct collections need pointer elements, and
+`input_set` now replaces duplicate keys — see CHANGELOG.)
+
 
 ## Install
 

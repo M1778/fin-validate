@@ -31,12 +31,14 @@ priv fun str_eq(a: string, b: string) <bool> {
 
 // --- public types ---
 
-enum FieldType { String, Int, Float, Bool, Email }
+// (FieldType enum retired: ftype is now an int code, see above.)
 
+// FieldType codes (backend limit 1: enum-typed struct fields do not lower,
+// so the type is an int): 0=String, 1=Int, 2=Float, 3=Bool, 4=Email.
 struct Field {
     name <string>,
     required <bool>,
-    ftype <FieldType>,
+    ftype <int>,
     min_len <int>,
     max_len <int>,
     has_min <bool>,
@@ -49,23 +51,31 @@ struct Field {
     custom_msg <string>,
 }
 
-struct Schema {
-    fields <&Collection<Field>>,
+#[export]
+pub struct Schema {
+    pub:
+        fields <&Collection<&Field>>,
 }
 
-struct InputValue {
-    key <string>,
-    value <string>,
+#[export]
+pub struct InputValue {
+    pub:
+        key <string>,
+        value <string>,
 }
 
-struct ValidationError {
-    field <string>,
-    message <string>,
+#[export]
+pub struct ValidationError {
+    pub:
+        field <string>,
+        message <string>,
 }
 
-struct ValidationResult {
-    ok <bool>,
-    errors <&Collection<ValidationError>>,
+#[export]
+pub struct ValidationResult {
+    pub:
+        ok <bool>,
+        errors <&Collection<&ValidationError>>,
 }
 
 // --- private parse helpers ---
@@ -179,10 +189,10 @@ priv fun try_parse_float(s: string) <FloatParse> {
     return FloatParse{ok: true, value: v};
 }
 
-priv fun lookup(input: &Collection<InputValue>, key: string) <Lookup> {
+priv fun lookup(input: &Collection<&InputValue>, key: string) <Lookup> {
     let n <int> = input.len();
     for (let i <int> = 0; i < n; i++) {
-        let kv <InputValue> = input.get(i);
+        let kv <&InputValue> = input.get(i);
         if (str_eq(kv.key, key)) {
             return Lookup{found: true, value: kv.value};
         }
@@ -251,16 +261,16 @@ priv fun field_msg(f: &Field, tail: string) <string> {
     return concat(concat(concat("field '", f.name), "' "), tail);
 }
 
-priv fun push_error(errs: &Collection<ValidationError>, f: &Field, tail: string) <noret> {
-    errs.push(ValidationError{field: f.name, message: field_msg(f, tail)});
+priv fun push_error(errs: &Collection<&ValidationError>, f: &Field, tail: string) <noret> {
+    errs.push(new ValidationError{field: f.name, message: field_msg(f, tail)});
 }
 
-priv fun check_value(f: &Field, value: string, errs: &Collection<ValidationError>) <noret> {
+priv fun check_value(f: &Field, value: string, errs: &Collection<&ValidationError>) <noret> {
     let vcs <[char]> = to_chars(value);
     let vlen <int> = vcs.length - 1;
     delete vcs;
 
-    if (f.ftype == FieldType::String) {
+    if (f.ftype == 0) {
         if (f.min_len >= 0 && vlen < f.min_len) {
             push_error(errs, f, "is too short");
         }
@@ -268,12 +278,12 @@ priv fun check_value(f: &Field, value: string, errs: &Collection<ValidationError
             push_error(errs, f, "is too long");
         }
     }
-    if (f.ftype == FieldType::Email) {
+    if (f.ftype == 4) {
         if (!valid_email(value)) {
             push_error(errs, f, "is not a valid email address");
         }
     }
-    if (f.ftype == FieldType::Int) {
+    if (f.ftype == 1) {
         let p <IntParse> = try_parse_int(value);
         if (!p.ok) {
             push_error(errs, f, "must be an integer");
@@ -283,7 +293,7 @@ priv fun check_value(f: &Field, value: string, errs: &Collection<ValidationError
             if (f.has_max && fv > f.max_val) { push_error(errs, f, "is above the maximum"); }
         }
     }
-    if (f.ftype == FieldType::Float) {
+    if (f.ftype == 2) {
         let p <FloatParse> = try_parse_float(value);
         if (!p.ok) {
             push_error(errs, f, "must be a number");
@@ -292,7 +302,7 @@ priv fun check_value(f: &Field, value: string, errs: &Collection<ValidationError
             if (f.has_max && p.value > f.max_val) { push_error(errs, f, "is above the maximum"); }
         }
     }
-    if (f.ftype == FieldType::Bool) {
+    if (f.ftype == 3) {
         if (!str_eq(value, "true") && !str_eq(value, "false") && !str_eq(value, "1") && !str_eq(value, "0")) {
             push_error(errs, f, "must be a boolean (true/false/1/0)");
         }
@@ -309,76 +319,75 @@ priv fun check_value(f: &Field, value: string, errs: &Collection<ValidationError
     if (f.has_custom) {
         let c <fn(string) -> bool> = f.custom;
         if (!c(value)) {
-            errs.push(ValidationError{field: f.name, message: f.custom_msg});
+            errs.push(new ValidationError{field: f.name, message: f.custom_msg});
         }
     }
 }
 
 // --- public API ---
 
-// Default custom validator (always passes) used for fields without one.
-priv fun no_custom(v: string) <bool> {
-    return true;
-}
+// NOTE (backend limit): a function *reference* as a struct field value
+// (e.g. `custom: no_custom`) does not lower. The default is null and
+// `has_custom` gates the call, so it is never invoked.
 
 // Create an empty schema. Add fields with the add_*_field functions.
 #[export]
 pub fun new_schema() <Schema> {
-    return Schema{fields: new Collection::<Field>{}};
+    return Schema{fields: new Collection::<&Field>{}};
 }
 
 #[export]
 pub fun add_string_field(s: &Schema, name: string, required: bool, min_len: int, max_len: int) <noret> {
-    s.fields.push(Field{name: name, required: required, ftype: FieldType::String,
+    s.fields.push(new Field{name: name, required: required, ftype: 0,
         min_len: min_len, max_len: max_len,
         has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
         allowed: new Collection::<string>{},
-        has_custom: false, custom: no_custom, custom_msg: ""});
+        has_custom: false, custom: null, custom_msg: ""});
 }
 
 #[export]
 pub fun add_email_field(s: &Schema, name: string, required: bool) <noret> {
-    s.fields.push(Field{name: name, required: required, ftype: FieldType::Email,
+    s.fields.push(new Field{name: name, required: required, ftype: 4,
         min_len: -1, max_len: -1,
         has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
         allowed: new Collection::<string>{},
-        has_custom: false, custom: no_custom, custom_msg: ""});
+        has_custom: false, custom: null, custom_msg: ""});
 }
 
 #[export]
 pub fun add_int_field(s: &Schema, name: string, required: bool, has_min: bool, min_v: float, has_max: bool, max_v: float) <noret> {
-    s.fields.push(Field{name: name, required: required, ftype: FieldType::Int,
+    s.fields.push(new Field{name: name, required: required, ftype: 1,
         min_len: -1, max_len: -1,
         has_min: has_min, min_val: min_v, has_max: has_max, max_val: max_v,
         allowed: new Collection::<string>{},
-        has_custom: false, custom: no_custom, custom_msg: ""});
+        has_custom: false, custom: null, custom_msg: ""});
 }
 
 #[export]
 pub fun add_float_field(s: &Schema, name: string, required: bool, has_min: bool, min_v: float, has_max: bool, max_v: float) <noret> {
-    s.fields.push(Field{name: name, required: required, ftype: FieldType::Float,
+    s.fields.push(new Field{name: name, required: required, ftype: 2,
         min_len: -1, max_len: -1,
         has_min: has_min, min_val: min_v, has_max: has_max, max_val: max_v,
         allowed: new Collection::<string>{},
-        has_custom: false, custom: no_custom, custom_msg: ""});
+        has_custom: false, custom: null, custom_msg: ""});
 }
 
 #[export]
 pub fun add_bool_field(s: &Schema, name: string, required: bool) <noret> {
-    s.fields.push(Field{name: name, required: required, ftype: FieldType::Bool,
+    s.fields.push(new Field{name: name, required: required, ftype: 3,
         min_len: -1, max_len: -1,
         has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
         allowed: new Collection::<string>{},
-        has_custom: false, custom: no_custom, custom_msg: ""});
+        has_custom: false, custom: null, custom_msg: ""});
 }
 
 #[export]
 pub fun add_one_of_field(s: &Schema, name: string, required: bool, allowed: &Collection<string>) <noret> {
-    s.fields.push(Field{name: name, required: required, ftype: FieldType::String,
+    s.fields.push(new Field{name: name, required: required, ftype: 0,
         min_len: -1, max_len: -1,
         has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
         allowed: allowed,
-        has_custom: false, custom: no_custom, custom_msg: ""});
+        has_custom: false, custom: null, custom_msg: ""});
 }
 
 // Custom validator: check receives the raw string value and returns true
@@ -386,7 +395,7 @@ pub fun add_one_of_field(s: &Schema, name: string, required: bool, allowed: &Col
 // function of the value, e.g. (s: string) <bool> => { ... }.
 #[export]
 pub fun add_custom_field(s: &Schema, name: string, required: bool, check: fn(string) -> bool, message: string) <noret> {
-    s.fields.push(Field{name: name, required: required, ftype: FieldType::String,
+    s.fields.push(new Field{name: name, required: required, ftype: 0,
         min_len: -1, max_len: -1,
         has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
         allowed: new Collection::<string>{},
@@ -396,35 +405,45 @@ pub fun add_custom_field(s: &Schema, name: string, required: bool, check: fn(str
 // Build an input set: new_input(), then input_set(input, key, value) per pair.
 // Dotted keys ("address.city") validate against dotted field names.
 #[export]
-pub fun new_input() <&Collection<InputValue>> {
-    return new Collection::<InputValue>{};
+pub fun new_input() <&Collection<&InputValue>> {
+    return new Collection::<&InputValue>{};
 }
 
+// Set a key/value pair, replacing any existing entry for the key
+// (so tests and callers can override defaults).
 #[export]
-pub fun input_set(input: &Collection<InputValue>, key: string, value: string) <noret> {
-    input.push(InputValue{key: key, value: value});
+pub fun input_set(input: &Collection<&InputValue>, key: string, value: string) <noret> {
+    let n <int> = input.len();
+    for (let i <int> = 0; i < n; i++) {
+        let kv <&InputValue> = input.get(i);
+        if (str_eq(kv.key, key)) {
+            kv.value = value;
+            return;
+        }
+    }
+    input.push(new InputValue{key: key, value: value});
 }
 
 // Validate input against the schema. Never aborts: problems come back as
 // ValidationError values in the result.
 #[export]
-pub fun schema_check(s: &Schema, input: &Collection<InputValue>) <ValidationResult> {
-    let errs <&Collection<ValidationError>> = new Collection::<ValidationError>{};
+pub fun schema_check(s: &Schema, input: &Collection<&InputValue>) <ValidationResult> {
+    let errs <&Collection<&ValidationError>> = new Collection::<&ValidationError>{};
     let n <int> = s.fields.len();
     for (let i <int> = 0; i < n; i++) {
-        let f <Field> = s.fields.get(i);
+        let f <&Field> = s.fields.get(i);
         let lu <Lookup> = lookup(input, f.name);
         if (!lu.found && f.required) {
-            push_error(errs, &f, "is required");
+            push_error(errs, f, "is required");
         }
         if (lu.found) {
             let vcs <[char]> = to_chars(lu.value);
             let empty <bool> = (vcs.length - 1) == 0;
             delete vcs;
             if (empty && f.required) {
-                push_error(errs, &f, "is required");
+                push_error(errs, f, "is required");
             } else if (!empty) {
-                check_value(&f, lu.value, errs);
+                check_value(f, lu.value, errs);
             }
         }
     }
@@ -437,7 +456,7 @@ pub fun error_count(r: &ValidationResult) <int> {
 }
 
 #[export]
-pub fun error_at(r: &ValidationResult, i: int) <ValidationError> {
+pub fun error_at(r: &ValidationResult, i: int) <&ValidationError> {
     return r.errors.get(i);
 }
 
