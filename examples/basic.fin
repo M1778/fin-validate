@@ -2,7 +2,7 @@
 //
 // Run: finc examples/basic.fin -I src -o basic && ./basic
 
-import { new_schema, add_string_field, add_email_field, add_int_field, add_one_of_field, new_input, input_set, schema_check, error_count, error_at, Schema, ValidationResult } from validate::fin;
+import { new_schema, add_string_field, add_email_field, add_int_range_field, add_one_of_field, new_input, input_set, input_clear, schema_check, schema_dispose, result_dispose, error_count, error_at, Schema, ValidationResult } from validate::fin;
 import { Collection } from collection::std;
 import { InputValue } from validate::fin;
 
@@ -10,7 +10,7 @@ fun main() <noret> {
     let s <Schema> = new_schema();
     add_string_field(&s, "username", true, 3, 20);
     add_email_field(&s, "email", true);
-    add_int_field(&s, "age", false, true, 13.0, true, 120.0);
+    add_int_range_field(&s, "age", false, true, 13, true, 120);
     let roles <&Collection<string>> = new Collection::<string>{};
     roles.push("admin");
     roles.push("user");
@@ -33,4 +33,11 @@ fun main() <noret> {
             printf("  - %s\n", error_at(&r, i).message);
         }
     }
+    result_dispose(&r);
+    schema_dispose(&s);
+    input_clear(form);
+    // Frozen Collection has no buffer-disposal API. Services should retain
+    // and reuse input/allowlist collections; delete frees only their headers.
+    delete form;
+    delete roles;
 }

@@ -3,19 +3,18 @@
 // Run: finc tests/test_validate.fin -I src -o test_validate && ./test_validate
 // (from the repo root).
 
-import { new_schema, add_string_field, add_email_field, add_int_field, add_float_field, add_bool_field, add_one_of_field, add_custom_field, new_input, input_set, schema_check, error_count, error_at, Schema, ValidationResult, ValidationError, InputValue } from validate::fin;
+import { new_schema, add_string_field, add_email_field, add_int_field, add_int_range_field, add_float_field, add_bool_field, add_one_of_field, add_custom_field, new_input, input_set, input_clear, schema_check, schema_check_into, new_result, schema_clear, schema_dispose, result_clear, result_dispose, error_count, error_at, Schema, ValidationResult, ValidationError, InputValue } from validate::fin;
 import { Collection } from collection::std;
 import { assert_true } from testing::std;
-import { equals, len } from strings::std;
+import { equals, len, repeat, concat, clone, free_str } from strings::std;
 
-fun signup_schema() <Schema> {
+fun signup_schema(roles: &Collection<string>) <Schema> {
     let s <Schema> = new_schema();
     add_string_field(&s, "username", true, 3, 20);
     add_email_field(&s, "email", true);
     add_int_field(&s, "age", false, true, 0.0, true, 150.0);
     add_float_field(&s, "height", false, true, 0.5, true, 2.8);
     add_bool_field(&s, "newsletter", false);
-    let roles <&Collection<string>> = new Collection::<string>{};
     roles.push("admin");
     roles.push("user");
     add_one_of_field(&s, "role", true, roles);
@@ -36,11 +35,265 @@ fun valid_input() <&Collection<&InputValue>> {
     return inp;
 }
 
+fun expect_value(s: &Schema, input: &Collection<&InputValue>, r: &ValidationResult, value: string, valid: bool, label: string) <noret> {
+    input_set(input, "value", value);
+    schema_check_into(s, input, r);
+    assert_true(r.ok == valid, label);
+    if (valid) {
+        assert_true(error_count(r) == 0, "accepted value leaves no stale errors");
+    } else {
+        assert_true(error_count(r) == 1, "rejected value returns exactly one error");
+        assert_true(equals(error_at(r, 0).field, "value"), "numeric error field");
+    }
+}
+
+fun test_int_boundaries() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    let r <ValidationResult> = new_result();
+    let min_int <int> = -2147483647 - 1;
+    add_int_range_field(&s, "value", true, true, min_int, true, 2147483647);
+    expect_value(&s, input, &r, "2147483647", true, "INT_MAX accepted");
+    expect_value(&s, input, &r, "-2147483648", true, "INT_MIN accepted");
+    expect_value(&s, input, &r, "2147483648", false, "INT_MAX plus one rejected");
+    expect_value(&s, input, &r, "-2147483649", false, "INT_MIN minus one rejected");
+    expect_value(&s, input, &r, "999999999999999999999999999999999999999999999999999", false, "huge integer rejected without overflow");
+    expect_value(&s, input, &r, "0000000000000000000000000002147483647", true, "leading zeroes preserve maximum");
+    expect_value(&s, input, &r, "-0000000000000000000000000002147483648", true, "leading zeroes preserve minimum");
+    expect_value(&s, input, &r, "0000000000000000000000000002147483648", false, "leading zeroes cannot hide overflow");
+    expect_value(&s, input, &r, "-0", true, "negative zero");
+    let invalid <[string]> = ["-", "+1", "1.0", "1e2", " 1", "1 ", "--1", "12a", ""];
+    foreach (value <string> in invalid) {
+        expect_value(&s, input, &r, value, false, "invalid integer syntax");
+    }
+    delete invalid;
+    schema_clear(&s);
+    add_int_range_field(&s, "value", true, true, 16777216, true, 16777216);
+    expect_value(&s, input, &r, "16777216", true, "2^24 exact endpoint");
+    expect_value(&s, input, &r, "16777217", false, "2^24 plus one cannot round down");
+    expect_value(&s, input, &r, "16777215", false, "2^24 minus one");
+    schema_clear(&s);
+    add_int_range_field(&s, "value", true, true, 16777217, true, 16777217);
+    expect_value(&s, input, &r, "16777217", true, "odd bound above 2^24 remains exact");
+    expect_value(&s, input, &r, "16777216", false, "exact minimum cannot round down");
+    expect_value(&s, input, &r, "16777218", false, "exact maximum cannot round up");
+    schema_clear(&s);
+    add_int_range_field(&s, "value", true, true, -16777217, true, -16777217);
+    expect_value(&s, input, &r, "-16777217", true, "negative exact bound");
+    expect_value(&s, input, &r, "-16777216", false, "negative exact maximum");
+    expect_value(&s, input, &r, "-16777218", false, "negative exact minimum");
+    schema_clear(&s);
+    add_int_range_field(&s, "value", true, true, 2147483646, true, 2147483646);
+    expect_value(&s, input, &r, "2147483647", false, "maximum endpoint cannot bypass adjacent bound");
+    schema_clear(&s);
+    add_int_range_field(&s, "value", true, true, -2147483647, true, -2147483647);
+    expect_value(&s, input, &r, "-2147483648", false, "minimum endpoint cannot bypass adjacent bound");
+    schema_clear(&s);
+    add_int_range_field(&s, "value", true, false, 100, false, -100);
+    expect_value(&s, input, &r, "-2147483648", true, "disabled exact limits ignored");
+    schema_clear(&s);
+    add_int_field(&s, "value", true, false, 0.0, true, 16777216.0);
+    expect_value(&s, input, &r, "16777216", true, "legacy representable maximum remains inclusive");
+    expect_value(&s, input, &r, "16777217", false, "legacy maximum cannot round input down");
+    schema_clear(&s);
+    add_int_field(&s, "value", true, true, -16777216.0, false, 0.0);
+    expect_value(&s, input, &r, "-16777216", true, "legacy negative minimum remains inclusive");
+    expect_value(&s, input, &r, "-16777217", false, "legacy negative minimum cannot round input up");
+    schema_clear(&s);
+    add_int_field(&s, "value", true, false, 0.0, true, -16777218.0);
+    expect_value(&s, input, &r, "-16777218", true, "legacy negative maximum remains inclusive");
+    expect_value(&s, input, &r, "-16777217", false, "legacy negative maximum rejects greater integer");
+    schema_clear(&s);
+    add_int_field(&s, "value", true, true, 2147483648.0, false, 0.0);
+    expect_value(&s, input, &r, "2147483647", false, "INT_MAX cannot round up to legacy minimum outside int32");
+    schema_clear(&s);
+    add_int_field(&s, "value", true, false, 0.0, true, 2147483647.0);
+    expect_value(&s, input, &r, "2147483647", true, "INT_MAX accepted below rounded legacy maximum");
+    expect_value(&s, input, &r, "2147483648", false, "rounded legacy maximum cannot bypass int32 parsing");
+    schema_clear(&s);
+    add_int_field(&s, "value", true, false, 0.0, true, 2147483520.0);
+    expect_value(&s, input, &r, "2147483520", true, "largest float below int32 maximum is inclusive");
+    expect_value(&s, input, &r, "2147483521", false, "integer above high legacy maximum cannot round down");
+    expect_value(&s, input, &r, "2147483647", false, "INT_MAX exceeds lower representable legacy maximum");
+    schema_clear(&s);
+    add_int_field(&s, "value", true, true, -2147483648.0, true, -2147483648.0);
+    expect_value(&s, input, &r, "-2147483648", true, "INT_MIN remains exact with float bounds");
+    expect_value(&s, input, &r, "-2147483647", false, "integer above INT_MIN cannot round down to legacy maximum");
+    schema_clear(&s);
+    add_int_field(&s, "value", true, false, 0.0, true, 16777217.0);
+    expect_value(&s, input, &r, "16777217", false, "unrepresentable legacy bound itself still rounds before comparison");
+    schema_clear(&s);
+    add_int_field(&s, "value", true, true, 1.5, true, 2.5);
+    expect_value(&s, input, &r, "1", false, "fractional legacy minimum supported");
+    expect_value(&s, input, &r, "2", true, "integer between fractional legacy bounds");
+    expect_value(&s, input, &r, "3", false, "fractional legacy maximum supported");
+    result_dispose(&r);
+    schema_dispose(&s);
+    input_clear(input);
+    delete input;
+}
+
+fun test_float_boundaries() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    let r <ValidationResult> = new_result();
+    add_float_field(&s, "value", true, false, 0.0, false, 0.0);
+    let valid <[string]> = ["0", "-0", "1", "-1", ".5", "-.5", "1.", "-1.", "1.68", "00000.125", "340282346638528859811704183484516925440", "-340282346638528859811704183484516925440"];
+    foreach (value <string> in valid) {
+        expect_value(&s, input, &r, value, true, "finite decimal accepted");
+    }
+    delete valid;
+    let invalid <[string]> = ["NaN", "nan", "inf", "-inf", "Infinity", "1e3", "+1", ".", "-.", "-", "1.2.3", "1x", " 1", "1 ", "", "340282400000000000000000000000000000000", "-340282400000000000000000000000000000000"];
+    foreach (value <string> in invalid) {
+        expect_value(&s, input, &r, value, false, "nonfinite, overflow or malformed float rejected");
+    }
+    delete invalid;
+    let zeroes <string> = repeat("0", 4096);
+    let ones <string> = repeat("9", 4096);
+    let exact <string> = concat("1.", zeroes);
+    let below <string> = concat("0.", zeroes);
+    let above <string> = concat("2.", zeroes);
+    let overflow <string> = concat("999999999999999999999999999999999999999999.", zeroes);
+    let negative <string> = concat("-999999999999999999999999999999999999999999.", zeroes);
+    expect_value(&s, input, &r, zeroes, true, "long zero integer stays finite");
+    expect_value(&s, input, &r, ones, false, "very long integer float cannot overflow");
+    expect_value(&s, input, &r, overflow, false, "long fractional suffix cannot turn overflow into accepted NaN");
+    expect_value(&s, input, &r, negative, false, "negative overflow with fractional suffix");
+    schema_clear(&s);
+    add_float_field(&s, "value", true, true, 1.0, true, 1.0);
+    expect_value(&s, input, &r, exact, true, "4096 trailing fractional zeroes preserve one");
+    expect_value(&s, input, &r, below, false, "long zero fraction cannot bypass minimum");
+    assert_true(equals(error_at(&r, 0).message, "field 'value' is below the minimum"), "long fraction minimum message");
+    expect_value(&s, input, &r, above, false, "former NaN-producing input cannot bypass maximum");
+    assert_true(equals(error_at(&r, 0).message, "field 'value' is above the maximum"), "long fraction maximum message");
+    expect_value(&s, input, &r, overflow, false, "overflow is invalid even with limits");
+    assert_true(equals(error_at(&r, 0).message, "field 'value' must be a number"), "overflow number message");
+    schema_clear(&s);
+    add_float_field(&s, "value", true, true, -0.125, true, -0.125);
+    let negative_fraction <string> = concat("-0.125", zeroes);
+    expect_value(&s, input, &r, negative_fraction, true, "negative long fractional value");
+    schema_clear(&s);
+    add_float_field(&s, "value", true, true, 0.0, true, 0.0);
+    let small_prefix <string> = concat("0.", zeroes);
+    let tiny <string> = concat(small_prefix, "1");
+    expect_value(&s, input, &r, tiny, true, "tiny fractions underflow to zero by policy");
+    input_clear(input);
+    delete input;
+    result_dispose(&r);
+    schema_dispose(&s);
+    free_str(zeroes);
+    free_str(ones);
+    free_str(exact);
+    free_str(below);
+    free_str(above);
+    free_str(overflow);
+    free_str(negative);
+    free_str(negative_fraction);
+    free_str(small_prefix);
+    free_str(tiny);
+}
+
+fun test_allowlist() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    let r <ValidationResult> = new_result();
+    let allowed <&Collection<string>> = new Collection::<string>{};
+    add_one_of_field(&s, "value", true, allowed);
+    expect_value(&s, input, &r, "admin", false, "empty allowlist fails closed");
+    assert_true(equals(error_at(&r, 0).message, "field 'value' is not an allowed value"), "empty allowlist message");
+    allowed.push("user");
+    expect_value(&s, input, &r, "user", true, "allowlist is borrowed and observes changes");
+    expect_value(&s, input, &r, "admin", false, "configured membership still enforced");
+    allowed.clear();
+    expect_value(&s, input, &r, "user", false, "clearing borrowed allowlist closes access");
+    schema_clear(&s);
+    add_one_of_field(&s, "value", true, null);
+    expect_value(&s, input, &r, "admin", false, "null configured allowlist fails closed");
+    schema_clear(&s);
+    add_one_of_field(&s, "value", false, allowed);
+    expect_value(&s, input, &r, "", true, "optional empty value still skips validation");
+    input_clear(input);
+    schema_check_into(&s, input, &r);
+    assert_true(r.ok, "optional missing value still allowed");
+    schema_clear(&s);
+    add_string_field(&s, "value", true, -1, -1);
+    expect_value(&s, input, &r, "admin", true, "ordinary string has no allowlist");
+    schema_dispose(&s);
+    allowed.push("survives-schema-disposal");
+    assert_true(equals(allowed.get(0), "survives-schema-disposal"), "borrowed collection not freed by schema");
+    result_dispose(&r);
+    input_clear(input);
+    delete input;
+    delete allowed;
+}
+
+fun test_reuse_and_disposal() <noret> {
+    let empty_s <Schema> = Schema{};
+    let empty_r <ValidationResult> = ValidationResult{};
+    schema_dispose(&empty_s);
+    schema_dispose(&empty_s);
+    result_dispose(&empty_r);
+    result_dispose(&empty_r);
+    assert_true(empty_r.ok && error_count(&empty_r) == 0, "zero-initialized disposal is safe and idempotent");
+    let s <Schema> = new_schema();
+    let r <ValidationResult> = new_result();
+    let input <&Collection<&InputValue>> = new_input();
+    let dynamic_name <string> = clone("value");
+    let dynamic_message <string> = clone("borrowed custom message");
+    let check <fn(string) -> bool> = (value: string) <bool> => equals(value, "valid");
+    for (let j <int> = 0; j < 100; j++) {
+        // Ten fields/errors forces growth past the initial array capacity.
+        for (let i <int> = 0; i < 5; i++) {
+            add_string_field(&s, dynamic_name, true, 2, 20);
+            add_custom_field(&s, dynamic_name, true, check, dynamic_message);
+        }
+        for (let i <int> = 0; i < 100; i++) {
+            input_set(input, dynamic_name, "x");
+            schema_check_into(&s, input, &r);
+            assert_true(!r.ok && error_count(&r) == 10, "repeated failures replace rather than append errors");
+            assert_true(error_at(&r, 0).owns_message, "generated message is owned");
+            assert_true(!error_at(&r, 1).owns_message, "custom message remains borrowed");
+            assert_true(equals(error_at(&r, 1).message, dynamic_message), "borrowed custom text survives repeated clears");
+            input_set(input, dynamic_name, "valid");
+            schema_check_into(&s, input, &r);
+            assert_true(r.ok && error_count(&r) == 0, "success removes old failing errors");
+        }
+        schema_clear(&s);
+        schema_clear(&s);
+        result_clear(&r);
+        result_clear(&r);
+        input_clear(input);
+        assert_true(input.len() == 0, "input clear frees entries for reuse");
+    }
+    add_custom_field(&s, dynamic_name, true, check, "literal custom message");
+    input_set(input, dynamic_name, "x");
+    schema_check_into(&s, input, &r);
+    result_dispose(&r);
+    result_dispose(&r);
+    schema_dispose(&s);
+    schema_dispose(&s);
+    assert_true(equals(dynamic_message, "borrowed custom message"), "cleanup never frees caller-owned messages");
+    assert_true(equals(dynamic_name, "value"), "cleanup never frees caller-owned names");
+    // Disposed handles can be reused without creating a new owner.
+    add_string_field(&s, dynamic_name, true, 5, 8);
+    schema_check_into(&s, input, &r);
+    assert_true(!r.ok && error_count(&r) == 1, "disposed handles support reuse");
+    schema_dispose(&s);
+    assert_true(equals(error_at(&r, 0).message, "field 'value' is too short"), "generated message survives schema disposal");
+    result_dispose(&r);
+    input_clear(input);
+    delete input;
+    free_str(dynamic_name);
+    free_str(dynamic_message);
+}
+
 fun main() <noret> {
-    let s <Schema> = signup_schema();
+    let roles <&Collection<string>> = new Collection::<string>{};
+    let s <Schema> = signup_schema(roles);
 
     // 1. fully valid input
-    let r1 <ValidationResult> = schema_check(&s, valid_input());
+    let i1 <&Collection<&InputValue>> = valid_input();
+    let r1 <ValidationResult> = schema_check(&s, i1);
     assert_true(r1.ok, "valid input should pass");
     assert_true(error_count(&r1) == 0, "valid input: no errors");
 
@@ -122,5 +375,35 @@ fun main() <noret> {
     let nr <ValidationResult> = schema_check(&ns, ni);
     assert_true(nr.ok, "nested dotted fields should pass");
 
-    printf("all fin-validate tests passed\n");
+    result_dispose(&r1);
+    result_dispose(&r2);
+    result_dispose(&r3);
+    result_dispose(&r4);
+    result_dispose(&r5);
+    result_dispose(&r6);
+    result_dispose(&r7);
+    result_dispose(&r8);
+    result_dispose(&r9);
+    result_dispose(&r10);
+    result_dispose(&nr);
+    schema_dispose(&s);
+    schema_dispose(&ns);
+    input_clear(i1); delete i1;
+    delete roles;
+    input_clear(i2); delete i2;
+    input_clear(i3); delete i3;
+    input_clear(i4); delete i4;
+    input_clear(i5); delete i5;
+    input_clear(i6); delete i6;
+    input_clear(i7); delete i7;
+    input_clear(i8); delete i8;
+    input_clear(i9); delete i9;
+    input_clear(i10); delete i10;
+    input_clear(ni); delete ni;
+
+    test_int_boundaries();
+    test_float_boundaries();
+    test_allowlist();
+    test_reuse_and_disposal();
+    printf("all fin-validate tests passed: 11 baseline scenarios, 4 boundary/ownership groups, 10000 failure-success reuse cycles\n");
 }

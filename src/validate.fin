@@ -1,27 +1,15 @@
 // SPDX-License-Identifier: MIT
-// fin-validate v0.1.0 — input validation for Fin.
-//
-// Schema-driven validation of untrusted string input (forms, query params,
-// config values): required checks, types (string/int/float/bool/email),
-// length and numeric ranges, allowed-value lists, and custom validators.
-// Nested data is validated through dotted field names ("address.city").
-//
-// Errors are values, never blame: every problem is reported as a
-// ValidationError with a human-readable message.
-//
-// STATUS: written against docs/agent-guide.md (Fin v0.4.0). UNVERIFIED — no
-// finc binary was available in this environment, so nothing below has been
-// type-checked or executed yet. See README.md "Verification status".
+// Schema-driven validation of borrowed NUL-terminated input strings.
+// Invalid values return errors; caller programming errors (invalid error indices,
+// dangling pointers, aborting custom callbacks) are not recoverable here.
 
 #[stdimport] %{
 import { Collection } from collection::std;
-import { to_chars, from_chars, concat, parse_int } from strings::std;
+import { to_chars, concat, free_str, len, is_empty } from strings::std;
 }%
 
 namespace fin {
 
-// strcmp, bound locally (same pattern as lib/std/testing.fin) so the only
-// strings::std functions we rely on are to_chars/from_chars/concat/parse_int.
 #[llvm_name="strcmp"]
 @define valid_strcmp(a: string, b: string) <int>;
 
@@ -29,12 +17,7 @@ priv fun str_eq(a: string, b: string) <bool> {
     return valid_strcmp(a, b) == 0;
 }
 
-// --- public types ---
-
-// (FieldType enum retired: ftype is now an int code, see above.)
-
-// FieldType codes (backend limit 1: enum-typed struct fields do not lower,
-// so the type is an int): 0=String, 1=Int, 2=Float, 3=Bool, 4=Email.
+// Type codes: 0=string, 1=int, 2=float, 3=bool, 4=email.
 struct Field {
     name <string>,
     required <bool>,
@@ -45,16 +28,23 @@ struct Field {
     min_val <float>,
     has_max <bool>,
     max_val <float>,
+    exact_int <bool>,
+    min_int <int>,
+    max_int <int>,
+    has_allowed <bool>,
     allowed <&Collection<string>>,
     has_custom <bool>,
     custom <fn(string) -> bool>,
     custom_msg <string>,
 }
 
+// Owning handles: do not copy after construction. Use the named APIs, not the
+// public backing fields. Manual disposal avoids implicit double-free on copies.
 #[export]
 pub struct Schema {
     pub:
-        fields <&Collection<&Field>>,
+        fields <[&Field]>,
+        field_count <int>,
 }
 
 #[export]
@@ -69,16 +59,16 @@ pub struct ValidationError {
     pub:
         field <string>,
         message <string>,
+        owns_message <bool>,
 }
 
 #[export]
 pub struct ValidationResult {
     pub:
         ok <bool>,
-        errors <&Collection<&ValidationError>>,
+        errors <[&ValidationError]>,
+        error_size <int>,
 }
-
-// --- private parse helpers ---
 
 struct IntParse { ok <bool>, value <int>, }
 struct FloatParse { ok <bool>, value <float>, }
@@ -88,8 +78,8 @@ priv fun is_digit(c: char) <bool> {
     return c >= '0' && c <= '9';
 }
 
-// Well-formed 32-bit decimal integer, no abort on bad input (parse_int
-// blames, so it is only called after this check passes).
+// Accumulate only after checking the next digit. No aborting stdlib parser,
+// no signed overflow, and arbitrary leading zeroes do not consume range.
 priv fun try_parse_int(s: string) <IntParse> {
     let cs <[char]> = to_chars(s);
     let n <int> = cs.length - 1;
@@ -103,90 +93,81 @@ priv fun try_parse_int(s: string) <IntParse> {
         delete cs;
         return IntParse{ok: false, value: 0};
     }
+    let limit <long> = cast<long>(2147483647);
+    if (neg) { limit += cast<long>(1); }
+    let acc <long> = cast<long>(0);
     for (let i <int> = start; i < n; i++) {
         if (!is_digit(cs[i])) {
             delete cs;
             return IntParse{ok: false, value: 0};
         }
-    }
-    let digits <int> = n - start;
-    if (digits > 10) {
-        delete cs;
-        return IntParse{ok: false, value: 0};
-    }
-    if (digits == 10) {
-        // Same length as the bound, so lexicographic order is numeric order.
-        let bound <string> = "2147483647";
-        if (neg) { bound = "2147483648"; }
-        let bc <[char]> = to_chars(bound);
-        let over <bool> = false;
-        let under <bool> = false;
-        for (let i <int> = 0; i < 10; i++) {
-            if (!over && !under) {
-                if (cs[start + i] > bc[i]) { over = true; }
-                if (cs[start + i] < bc[i]) { under = true; }
-            }
-        }
-        delete bc;
-        if (over) {
+        let digit <long> = cast<long>(cast<int>(cs[i]) - cast<int>('0'));
+        if (acc > (limit - digit) / cast<long>(10)) {
             delete cs;
             return IntParse{ok: false, value: 0};
         }
+        acc = acc * cast<long>(10) + digit;
     }
-    let v <int> = parse_int(s);
     delete cs;
-    return IntParse{ok: true, value: v};
+    if (neg) { acc = -acc; }
+    return IntParse{ok: true, value: cast<int>(acc)};
 }
 
-// [-]digits[.digits], at least one digit. No exponents in v0.1.0.
+// Decimal only, with an optional minus and at most one dot; at least one
+// digit is required. Retains support for .5 and 1. (no plus or exponent).
+// Fractional place values decrease: a long fraction never overflows a
+// numerator/divisor pair. Double intermediates reduce premature rounding.
 priv fun try_parse_float(s: string) <FloatParse> {
     let cs <[char]> = to_chars(s);
     let n <int> = cs.length - 1;
     let neg <bool> = false;
-    let i <int> = 0;
+    let start <int> = 0;
     if (n > 0 && cs[0] == '-') {
         neg = true;
-        i = 1;
+        start = 1;
     }
     let seen_digit <bool> = false;
     let seen_dot <bool> = false;
-    for (let j <int> = i; j < n; j++) {
-        if (cs[j] == '.') {
+    let v <double> = cast<double>(0.0);
+    let place <double> = cast<double>(1.0);
+    // Exact largest finite binary32 value.
+    let max_float <float> = 340282346638528859811704183484516925440.0;
+    for (let i <int> = start; i < n; i++) {
+        if (cs[i] == '.') {
             if (seen_dot) {
                 delete cs;
                 return FloatParse{ok: false, value: 0.0};
             }
             seen_dot = true;
-        } else if (is_digit(cs[j])) {
+        } else if (is_digit(cs[i])) {
             seen_digit = true;
+            let digit <double> = cast<double>(cast<int>(cs[i]) - cast<int>('0'));
+            if (seen_dot) {
+                place = place / cast<double>(10.0);
+                v = v + digit * place;
+            } else {
+                // Keep intermediates finite even for enormous integer strings.
+                if (v > cast<double>(max_float)) {
+                    delete cs;
+                    return FloatParse{ok: false, value: 0.0};
+                }
+                v = v * cast<double>(10.0) + digit;
+            }
         } else {
             delete cs;
             return FloatParse{ok: false, value: 0.0};
         }
     }
-    if (!seen_digit) {
-        delete cs;
+    delete cs;
+    if (!seen_digit) { return FloatParse{ok: false, value: 0.0}; }
+    if (neg) { v = -v; }
+    let result <float> = cast<float>(v);
+    // Ordered comparisons reject both infinities and NaN, with or without
+    // schema range bounds. Tiny fractions may round/underflow to zero.
+    if (!(result >= -max_float && result <= max_float)) {
         return FloatParse{ok: false, value: 0.0};
     }
-    let v <float> = 0.0;
-    let j <int> = i;
-    while (j < n && cs[j] != '.') {
-        v = v * 10.0 + cast<float>(cast<int>(cs[j]) - cast<int>('0'));
-        j++;
-    }
-    if (j < n && cs[j] == '.') {
-        j++;
-        let div <float> = 1.0;
-        while (j < n) {
-            v = v * 10.0 + cast<float>(cast<int>(cs[j]) - cast<int>('0'));
-            div = div * 10.0;
-            j++;
-        }
-        v = v / div;
-    }
-    if (neg) { v = 0.0 - v; }
-    delete cs;
-    return FloatParse{ok: true, value: v};
+    return FloatParse{ok: true, value: result};
 }
 
 priv fun lookup(input: &Collection<&InputValue>, key: string) <Lookup> {
@@ -258,206 +239,268 @@ priv fun valid_email(s: string) <bool> {
 }
 
 priv fun field_msg(f: &Field, tail: string) <string> {
-    return concat(concat(concat("field '", f.name), "' "), tail);
+    let prefix <string> = concat("field '", f.name);
+    let subject <string> = concat(prefix, "' ");
+    free_str(prefix);
+    let message <string> = concat(subject, tail);
+    free_str(subject);
+    return message;
 }
 
-priv fun push_error(errs: &Collection<&ValidationError>, f: &Field, tail: string) <noret> {
-    errs.push(new ValidationError{field: f.name, message: field_msg(f, tail)});
-}
-
-priv fun check_value(f: &Field, value: string, errs: &Collection<&ValidationError>) <noret> {
-    let vcs <[char]> = to_chars(value);
-    let vlen <int> = vcs.length - 1;
-    delete vcs;
-
-    if (f.ftype == 0) {
-        if (f.min_len >= 0 && vlen < f.min_len) {
-            push_error(errs, f, "is too short");
-        }
-        if (f.max_len >= 0 && vlen > f.max_len) {
-            push_error(errs, f, "is too long");
-        }
+priv fun append_error(r: &ValidationResult, error: &ValidationError) <noret> {
+    if (r.errors == null || r.error_size == r.errors.length) {
+        let capacity <int> = 4;
+        if (r.errors != null) { capacity = r.errors.length * 2; }
+        let grown <[&ValidationError]> = new [&ValidationError, capacity]{};
+        for (let i <int> = 0; i < r.error_size; i++) { grown[i] = r.errors[i]; }
+        if (r.errors != null) { delete r.errors; }
+        r.errors = grown;
     }
-    if (f.ftype == 4) {
-        if (!valid_email(value)) {
-            push_error(errs, f, "is not a valid email address");
-        }
+    r.errors[r.error_size] = error;
+    r.error_size++;
+    r.ok = false;
+}
+
+priv fun push_error(r: &ValidationResult, f: &Field, tail: string) <noret> {
+    append_error(r, new ValidationError{field: f.name, message: field_msg(f, tail), owns_message: true});
+}
+
+priv fun check_value(f: &Field, value: string, r: &ValidationResult) <noret> {
+    if (f.ftype == 0) {
+        let vlen <int> = len(value);
+        if (f.min_len >= 0 && vlen < f.min_len) { push_error(r, f, "is too short"); }
+        if (f.max_len >= 0 && vlen > f.max_len) { push_error(r, f, "is too long"); }
+    }
+    if (f.ftype == 4 && !valid_email(value)) {
+        push_error(r, f, "is not a valid email address");
     }
     if (f.ftype == 1) {
         let p <IntParse> = try_parse_int(value);
         if (!p.ok) {
-            push_error(errs, f, "must be an integer");
+            push_error(r, f, "must be an integer");
+        } else if (f.exact_int) {
+            if (f.has_min && p.value < f.min_int) { push_error(r, f, "is below the minimum"); }
+            if (f.has_max && p.value > f.max_int) { push_error(r, f, "is above the maximum"); }
         } else {
-            let fv <float> = cast<float>(p.value);
-            if (f.has_min && fv < f.min_val) { push_error(errs, f, "is below the minimum"); }
-            if (f.has_max && fv > f.max_val) { push_error(errs, f, "is above the maximum"); }
+            // Promote both operands: every int32 and binary32 bound is exact
+            // in double. Only the caller's float bound may already be rounded.
+            let fv <double> = cast<double>(p.value);
+            if (f.has_min && fv < cast<double>(f.min_val)) { push_error(r, f, "is below the minimum"); }
+            if (f.has_max && fv > cast<double>(f.max_val)) { push_error(r, f, "is above the maximum"); }
         }
     }
     if (f.ftype == 2) {
         let p <FloatParse> = try_parse_float(value);
         if (!p.ok) {
-            push_error(errs, f, "must be a number");
+            push_error(r, f, "must be a number");
         } else {
-            if (f.has_min && p.value < f.min_val) { push_error(errs, f, "is below the minimum"); }
-            if (f.has_max && p.value > f.max_val) { push_error(errs, f, "is above the maximum"); }
+            if (f.has_min && p.value < f.min_val) { push_error(r, f, "is below the minimum"); }
+            if (f.has_max && p.value > f.max_val) { push_error(r, f, "is above the maximum"); }
         }
     }
     if (f.ftype == 3) {
         if (!str_eq(value, "true") && !str_eq(value, "false") && !str_eq(value, "1") && !str_eq(value, "0")) {
-            push_error(errs, f, "must be a boolean (true/false/1/0)");
+            push_error(r, f, "must be a boolean (true/false/1/0)");
         }
     }
-    if (f.allowed.len() > 0) {
+    if (f.has_allowed) {
         let ok <bool> = false;
-        for (let i <int> = 0; i < f.allowed.len(); i++) {
-            if (str_eq(value, f.allowed.get(i))) { ok = true; }
+        // A null or empty configured allowlist permits no nonempty value.
+        if (f.allowed != null) {
+            for (let i <int> = 0; i < f.allowed.len(); i++) {
+                if (str_eq(value, f.allowed.get(i))) { ok = true; break; }
+            }
         }
-        if (!ok) {
-            push_error(errs, f, "is not an allowed value");
-        }
+        if (!ok) { push_error(r, f, "is not an allowed value"); }
     }
     if (f.has_custom) {
         let c <fn(string) -> bool> = f.custom;
         if (!c(value)) {
-            errs.push(new ValidationError{field: f.name, message: f.custom_msg});
+            append_error(r, new ValidationError{field: f.name, message: f.custom_msg, owns_message: false});
         }
     }
 }
 
-// --- public API ---
-
-// NOTE (backend limit): a function *reference* as a struct field value
-// (e.g. `custom: no_custom`) does not lower. The default is null and
-// `has_custom` gates the call, so it is never invoked.
-
-// Create an empty schema. Add fields with the add_*_field functions.
+// Collections have a private buffer and no release API in the frozen stdlib.
+// Schema/result storage therefore owns arrays directly, not Collections.
 #[export]
 pub fun new_schema() <Schema> {
-    return Schema{fields: new Collection::<&Field>{}};
+    return Schema{};
+}
+
+priv fun append_field(s: &Schema, field: &Field) <noret> {
+    if (s.fields == null || s.field_count == s.fields.length) {
+        let capacity <int> = 4;
+        if (s.fields != null) { capacity = s.fields.length * 2; }
+        let grown <[&Field]> = new [&Field, capacity]{};
+        for (let i <int> = 0; i < s.field_count; i++) { grown[i] = s.fields[i]; }
+        if (s.fields != null) { delete s.fields; }
+        s.fields = grown;
+    }
+    s.fields[s.field_count] = field;
+    s.field_count++;
+}
+
+// Frees field objects, retaining capacity. Names, custom messages and allowed
+// lists are borrowed and are never freed or mutated by schema cleanup.
+#[export]
+pub fun schema_clear(s: &Schema) <noret> {
+    for (let i <int> = 0; i < s.field_count; i++) {
+        delete s.fields[i];
+        s.fields[i] = null;
+    }
+    s.field_count = 0;
+}
+
+#[export]
+pub fun schema_dispose(s: &Schema) <noret> {
+    schema_clear(s);
+    if (s.fields != null) { delete s.fields; }
+    let empty <Schema> = Schema{};
+    s.fields = empty.fields;
 }
 
 #[export]
 pub fun add_string_field(s: &Schema, name: string, required: bool, min_len: int, max_len: int) <noret> {
-    s.fields.push(new Field{name: name, required: required, ftype: 0,
-        min_len: min_len, max_len: max_len,
-        has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
-        allowed: new Collection::<string>{},
-        has_custom: false, custom: null, custom_msg: ""});
+    append_field(s, new Field{name: name, required: required, ftype: 0,
+        min_len: min_len, max_len: max_len});
 }
 
 #[export]
 pub fun add_email_field(s: &Schema, name: string, required: bool) <noret> {
-    s.fields.push(new Field{name: name, required: required, ftype: 4,
-        min_len: -1, max_len: -1,
-        has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
-        allowed: new Collection::<string>{},
-        has_custom: false, custom: null, custom_msg: ""});
+    append_field(s, new Field{name: name, required: required, ftype: 4,
+        min_len: -1, max_len: -1});
 }
 
+// Compatibility API: binary32 bound parameters, exact promoted comparisons.
 #[export]
 pub fun add_int_field(s: &Schema, name: string, required: bool, has_min: bool, min_v: float, has_max: bool, max_v: float) <noret> {
-    s.fields.push(new Field{name: name, required: required, ftype: 1,
+    append_field(s, new Field{name: name, required: required, ftype: 1,
         min_len: -1, max_len: -1,
-        has_min: has_min, min_val: min_v, has_max: has_max, max_val: max_v,
-        allowed: new Collection::<string>{},
-        has_custom: false, custom: null, custom_msg: ""});
+        has_min: has_min, min_val: min_v, has_max: has_max, max_val: max_v});
+}
+
+// Exact inclusive int32 bounds, including both endpoints. No float conversion.
+#[export]
+pub fun add_int_range_field(s: &Schema, name: string, required: bool, has_min: bool, min_v: int, has_max: bool, max_v: int) <noret> {
+    append_field(s, new Field{name: name, required: required, ftype: 1,
+        min_len: -1, max_len: -1, exact_int: true,
+        has_min: has_min, min_int: min_v, has_max: has_max, max_int: max_v});
 }
 
 #[export]
 pub fun add_float_field(s: &Schema, name: string, required: bool, has_min: bool, min_v: float, has_max: bool, max_v: float) <noret> {
-    s.fields.push(new Field{name: name, required: required, ftype: 2,
+    append_field(s, new Field{name: name, required: required, ftype: 2,
         min_len: -1, max_len: -1,
-        has_min: has_min, min_val: min_v, has_max: has_max, max_val: max_v,
-        allowed: new Collection::<string>{},
-        has_custom: false, custom: null, custom_msg: ""});
+        has_min: has_min, min_val: min_v, has_max: has_max, max_val: max_v});
 }
 
 #[export]
 pub fun add_bool_field(s: &Schema, name: string, required: bool) <noret> {
-    s.fields.push(new Field{name: name, required: required, ftype: 3,
-        min_len: -1, max_len: -1,
-        has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
-        allowed: new Collection::<string>{},
-        has_custom: false, custom: null, custom_msg: ""});
+    append_field(s, new Field{name: name, required: required, ftype: 3,
+        min_len: -1, max_len: -1});
 }
 
 #[export]
 pub fun add_one_of_field(s: &Schema, name: string, required: bool, allowed: &Collection<string>) <noret> {
-    s.fields.push(new Field{name: name, required: required, ftype: 0,
-        min_len: -1, max_len: -1,
-        has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
-        allowed: allowed,
-        has_custom: false, custom: null, custom_msg: ""});
+    append_field(s, new Field{name: name, required: required, ftype: 0,
+        min_len: -1, max_len: -1, has_allowed: true, allowed: allowed});
 }
 
-// Custom validator: check receives the raw string value and returns true
-// when it passes. Lambdas cannot capture locals — write check as a pure
-// function of the value, e.g. (s: string) <bool> => { ... }.
 #[export]
 pub fun add_custom_field(s: &Schema, name: string, required: bool, check: fn(string) -> bool, message: string) <noret> {
-    s.fields.push(new Field{name: name, required: required, ftype: 0,
-        min_len: -1, max_len: -1,
-        has_min: false, min_val: 0.0, has_max: false, max_val: 0.0,
-        allowed: new Collection::<string>{},
-        has_custom: true, custom: check, custom_msg: message});
+    append_field(s, new Field{name: name, required: required, ftype: 0,
+        min_len: -1, max_len: -1, has_custom: true, custom: check, custom_msg: message});
 }
 
-// Build an input set: new_input(), then input_set(input, key, value) per pair.
-// Dotted keys ("address.city") validate against dotted field names.
 #[export]
 pub fun new_input() <&Collection<&InputValue>> {
     return new Collection::<&InputValue>{};
 }
 
-// Set a key/value pair, replacing any existing entry for the key
-// (so tests and callers can override defaults).
+// Keys and values remain borrowed. Replacement does not free either string.
 #[export]
 pub fun input_set(input: &Collection<&InputValue>, key: string, value: string) <noret> {
     let n <int> = input.len();
     for (let i <int> = 0; i < n; i++) {
         let kv <&InputValue> = input.get(i);
-        if (str_eq(kv.key, key)) {
-            kv.value = value;
-            return;
-        }
+        if (str_eq(kv.key, key)) { kv.value = value; return; }
     }
     input.push(new InputValue{key: key, value: value});
 }
 
-// Validate input against the schema. Never aborts: problems come back as
-// ValidationError values in the result.
+// Free input entries, retain Collection capacity for reuse. The frozen stdlib
+// cannot dispose a Collection's private buffer; this does not pretend it can.
 #[export]
-pub fun schema_check(s: &Schema, input: &Collection<&InputValue>) <ValidationResult> {
-    let errs <&Collection<&ValidationError>> = new Collection::<&ValidationError>{};
-    let n <int> = s.fields.len();
-    for (let i <int> = 0; i < n; i++) {
-        let f <&Field> = s.fields.get(i);
+pub fun input_clear(input: &Collection<&InputValue>) <noret> {
+    for (let i <int> = 0; i < input.len(); i++) {
+        let entry <&InputValue> = input.get(i);
+        delete entry;
+    }
+    input.clear();
+}
+
+#[export]
+pub fun new_result() <ValidationResult> {
+    return ValidationResult{ok: true};
+}
+
+// Error pointers become invalid after clear/check_into/dispose. Only generated
+// messages are owned; custom messages and all field names remain borrowed.
+#[export]
+pub fun result_clear(r: &ValidationResult) <noret> {
+    for (let i <int> = 0; i < r.error_size; i++) {
+        let error <&ValidationError> = r.errors[i];
+        if (error.owns_message) { free_str(error.message); }
+        delete error;
+        r.errors[i] = null;
+    }
+    r.error_size = 0;
+    r.ok = true;
+}
+
+#[export]
+pub fun result_dispose(r: &ValidationResult) <noret> {
+    result_clear(r);
+    if (r.errors != null) { delete r.errors; }
+    let empty <ValidationResult> = ValidationResult{};
+    r.errors = empty.errors;
+}
+
+// Reuses result capacity while replacing all previous errors.
+#[export]
+pub fun schema_check_into(s: &Schema, input: &Collection<&InputValue>, r: &ValidationResult) <noret> {
+    result_clear(r);
+    for (let i <int> = 0; i < s.field_count; i++) {
+        let f <&Field> = s.fields[i];
         let lu <Lookup> = lookup(input, f.name);
-        if (!lu.found && f.required) {
-            push_error(errs, f, "is required");
-        }
+        if (!lu.found && f.required) { push_error(r, f, "is required"); }
         if (lu.found) {
-            let vcs <[char]> = to_chars(lu.value);
-            let empty <bool> = (vcs.length - 1) == 0;
-            delete vcs;
-            if (empty && f.required) {
-                push_error(errs, f, "is required");
-            } else if (!empty) {
-                check_value(f, lu.value, errs);
+            if (is_empty(lu.value)) {
+                if (f.required) { push_error(r, f, "is required"); }
+            } else {
+                check_value(f, lu.value, r);
             }
         }
     }
-    return ValidationResult{ok: errs.len() == 0, errors: errs};
+}
+
+#[export]
+pub fun schema_check(s: &Schema, input: &Collection<&InputValue>) <ValidationResult> {
+    let r <ValidationResult> = new_result();
+    schema_check_into(s, input, &r);
+    return r;
 }
 
 #[export]
 pub fun error_count(r: &ValidationResult) <int> {
-    return r.errors.len();
+    return r.error_size;
 }
 
 #[export]
 pub fun error_at(r: &ValidationResult, i: int) <&ValidationError> {
-    return r.errors.get(i);
+    blame i >= 0 && i < r.error_size, "error index out of bounds";
+    return r.errors[i];
 }
 
 }
