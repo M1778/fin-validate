@@ -18,7 +18,7 @@ fun main() <noret> {
     add_one_of_field(&s, "role", true, roles);
 
     // Simulate a sloppy form submission.
-    let form <&Collection<InputValue>> = new_input();
+    let form <&Collection<&InputValue>> = new_input();
     input_set(form, "username", "al");
     input_set(form, "email", "alice-at-example.com");
     input_set(form, "age", "200");
