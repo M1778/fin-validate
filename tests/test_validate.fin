@@ -389,13 +389,13 @@ fun main() <noret> {
     input_set(i8c, "username", repeat("a", 21));
     let r8c <ValidationResult> = schema_check(&s, i8c);
     assert_true(!r8c.ok, "username of max_len + 1 (21) must be rejected");
-    assert_true(equals(error_at(&r8c, 0).message, "field 'username' is too long"), "max_len message");
+    assert_true(equals(error_at(&r8c, 0).message, "field 'username' is too long: 21 bytes, maximum 20"), "max_len message");
 
     let i8d <&Collection<&InputValue>> = valid_input();
     input_set(i8d, "username", repeat("a", 60));
     let r8d <ValidationResult> = schema_check(&s, i8d);
     assert_true(!r8d.ok, "username far over max_len must be rejected");
-    assert_true(equals(error_at(&r8d, 0).message, "field 'username' is too long"), "max_len message at 60");
+    assert_true(equals(error_at(&r8d, 0).message, "field 'username' is too long: 60 bytes, maximum 20"), "max_len message at 60");
 
     // 8e. A field declared with no upper bound (-1) must accept any length.
     // Without this, "max_len < 0 means unlimited" is an assumption rather than a fact.
