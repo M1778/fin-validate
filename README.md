@@ -22,13 +22,13 @@ commands and their output.
 
 | Platform | Status |
 | --- | --- |
-| Linux x86_64 (musl release archive) | Tested locally, both suites and example run |
-| macOS x86_64 / arm64, Linux arm64 | CI lanes exist; not run on this machine |
-| Windows x86_64 | CI lane exists with `shell: bash`; not run on this machine |
+| Linux x86_64 (musl release archive) | Run on this machine: all three suites and the example |
+| Linux arm64, macOS arm64, Windows x86_64 | CI compiles **and executes** every suite on each; not run on this machine |
+| macOS x86_64 (Intel) | **Untested.** The published `x86_64-apple-darwin` archive links Homebrew `llvm@22`, which Homebrew ships for Apple Silicon only |
+| Other architectures | Untested |
 
-CI compiles and **executes** all three test programs on Linux x86_64 and arm64,
-macOS arm64 and x86_64, and Windows x86_64. A platform is only claimed tested
-where the run happened.
+A platform is only claimed tested where the run happened. CI runs the four lanes
+above on every pull request.
 
 ## What it does
 

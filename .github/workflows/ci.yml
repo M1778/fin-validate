@@ -1,5 +1,20 @@
 name: CI
 
+# The compiler comes from a pinned published release, not from a source build.
+#
+# FINC_VERSION pins it; .github/scripts/install_finc.py verifies the archive's
+# sha256 against the release index before unpacking. On Linux it takes the static
+# musl build, which needs no LLVM runtime on the runner.
+#
+# The macOS archive is *not* self-contained: it links
+# /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib, so the runtime has to be installed
+# before finc can start. That is why the macOS lane installs llvm@22 first.
+#
+# Intel macOS is not a lane. The published x86_64-apple-darwin archive needs the
+# same dylib, Homebrew publishes llvm@22 for Apple Silicon only, and covering it
+# would mean a six-minute source build of the compiler per run. The README says
+# Intel macOS is untested rather than claiming it.
+
 on:
   push:
     branches: [master, main, production/hardening]
@@ -25,149 +40,89 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
-      # Every platform reports: "which platforms are broken" is the question.
+      # A validation library that fails on one platform is a fact worth learning
+      # alongside whether it passes on the others, so the matrix does not stop at
+      # the first failure.
       fail-fast: false
       matrix:
         include:
-          # The installer picks the host triple, so no triple is listed here.
-          #
-          # The published macOS and Linux-gnu archives link libLLVM dynamically,
-          # so a lane needs LLVM 22 installed too. Homebrew publishes llvm@22 for
-          # Apple Silicon only (no x86_64 bottle), so an Intel macOS runner cannot
-          # run the x86_64 artifact; that absence is a property of the release, and
-          # `macos-legacy` compiles the source instead so Intel coverage exists
-          # rather than silently disappearing. Everywhere else installs LLVM 22
-          # and runs the release artifact.
           - name: linux-x86_64
             runner: ubuntu-24.04
-            llvm: apt
           - name: linux-arm64
             runner: ubuntu-24.04-arm
-            llvm: apt
           - name: macos-arm64
             runner: macos-15
             llvm: brew
-          - name: macos-legacy
-            runner: macos-15-intel
-            finc: source
           - name: windows-x86_64
             runner: windows-2022
             exe: .exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # The release archive links libLLVM dynamically on Linux and macOS, so the
-      # runtime has to be present before finc can run at all. Pinned to the major
-      # the release was built against; a mismatch fails at `finc --version`
-      # rather than producing confusing downstream errors.
-      - name: Install LLVM 22 (Linux)
-        if: matrix.llvm == 'apt'
-        run: |
-          set -euo pipefail
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
-          codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/$codename/ llvm-toolchain-$codename-22 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm22.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libllvm22
-          sudo ldconfig
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
-      - name: Install LLVM 22 (macOS)
+      # Homebrew ships libLLVM.dylib rather than libLLVM-<major>, and finc looks
+      # for the Homebrew keg at link time. Installing it is what lets both the
+      # compiler start and the programs it builds link.
+      - name: Install the LLVM runtime (macOS)
         if: matrix.llvm == 'brew'
+        run: brew install llvm@22
+
+      - name: Install the pinned finc
+        run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
+
+      - name: Put finc on PATH
         run: |
-          set -euo pipefail
-          brew install llvm@22
+          echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/finc/bin/finc" --version
 
-      # The release archive carries bin/finc and lib/std, and finc finds its
-      # standard library relative to its own binary, so no --fin-libs is needed.
-      # The installer verifies the published SHA-256 and refuses an artifact it
-      # cannot verify.
-      - name: Install pinned finc
-        if: matrix.finc != 'source'
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/install_finc.py
-          echo "${{ github.workspace }}/.finc/bin" >> "$GITHUB_PATH"
-
-      # finc links generated programs with clang, which on Windows needs the
-      # Visual Studio SDK libraries from a Developer shell. Without this the
-      # compiler runs but every `-o` build fails at the link step.
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
-
-      - name: Report the linker driver
-        if: runner.os == 'Windows'
-        run: |
-          clang --version | head -1
-
-      # Only the lane whose published artifact cannot run does this. Homebrew
-      # publishes llvm@22 for Apple Silicon only, so the x86_64 archive links a
-      # dylib no Intel runner has. Building the compiler from the v1.0.0 tag keeps
-      # Intel coverage instead of dropping the lane and calling it covered.
-      #
-      # The compiler's setup-toolchain action is not reused: it resolves
-      # CMakeLists.txt against the workspace root, so it cannot be run from
-      # another repository's checkout.
-      - name: Install the compiler's build dependencies (legacy lane)
-        if: matrix.finc == 'source'
-        run: |
-          set -euo pipefail
-          brew install llvm@22 cmake ninja bison flex conan
-          {
-            echo "PATH=$(brew --prefix llvm@22)/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
-            echo "CC=$(brew --prefix llvm@22)/bin/clang"
-            echo "CXX=$(brew --prefix llvm@22)/bin/clang++"
-          } >> "$GITHUB_ENV"
-
-      - name: Build finc from source (legacy lane)
-        if: matrix.finc == 'source'
-        run: |
-          set -euo pipefail
-          git clone --depth 1 --branch v1.0.0 https://github.com/M1778/Fin.git .fin-src
-          cd .fin-src
-          rm -f CMakeUserPresets.json
-          ./build.sh --release --no-test
-          echo "$GITHUB_WORKSPACE/.fin-src/build" >> "$GITHUB_PATH"
-
+      # The installer only checks that some contract integer is reported. This
+      # library is written and tested against 3, and finn branches on it.
       - name: Require contract 3
         run: |
           set -euo pipefail
           finc --version | tee version.txt
           grep -q "contract 3" version.txt
 
-      # A type-check is not a test. Every script below builds an executable and
-      # runs it; a nonzero program exit fails the job.
+      # finc links generated programs with clang, which on Windows needs the
+      # Visual Studio SDK libraries from a Developer shell.
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+
       - name: Type-check the library
         run: finc src/validate.fin
 
+      # Every step below builds an executable and runs it. A type-check is not a
+      # test, and a nonzero program exit fails the job.
       - name: Baseline and ownership tests
         run: |
           set -euo pipefail
-          finc tests/test_validate.fin -I src -o "test_validate${{ matrix.exe }}"
-          "./test_validate${{ matrix.exe }}"
+          finc tests/test_validate.fin -I src -o "$RUNNER_TEMP/test_validate${{ matrix.exe }}"
+          "$RUNNER_TEMP/test_validate${{ matrix.exe }}"
 
       - name: Boundary tests
         run: |
           set -euo pipefail
-          finc tests/test_boundaries.fin -I src -o "test_boundaries${{ matrix.exe }}"
-          "./test_boundaries${{ matrix.exe }}"
+          finc tests/test_boundaries.fin -I src -o "$RUNNER_TEMP/test_boundaries${{ matrix.exe }}"
+          "$RUNNER_TEMP/test_boundaries${{ matrix.exe }}"
 
       - name: Reuse tests
         run: |
           set -euo pipefail
-          finc tests/test_reuse.fin -I src -o "test_reuse${{ matrix.exe }}"
-          "./test_reuse${{ matrix.exe }}"
+          finc tests/test_reuse.fin -I src -o "$RUNNER_TEMP/test_reuse${{ matrix.exe }}"
+          "$RUNNER_TEMP/test_reuse${{ matrix.exe }}"
 
-      - name: Example
+      - name: Example output
         run: |
           set -euo pipefail
-          finc examples/basic.fin -I src -o "example_basic${{ matrix.exe }}"
+          finc examples/basic.fin -I src -o "$RUNNER_TEMP/example_basic${{ matrix.exe }}"
           # The program writes through the C runtime, which opens stdout in text
           # mode on Windows and turns every "\n" into "\r\n". Compare with the
-          # carriage returns removed so the assertion is about the message, not
-          # the host's newline convention.
-          output="$("./example_basic${{ matrix.exe }}" | tr -d '\r')"
+          # carriage returns removed so this is about the message, not the host's
+          # newline convention.
+          output="$("$RUNNER_TEMP/example_basic${{ matrix.exe }}" | tr -d '\r')"
           printf '%s\n' "$output"
           expected="signup rejected, 4 problem(s):
             - field 'username' is too short: 2 bytes, minimum 3
@@ -176,8 +131,7 @@ jobs:
             - field 'role' is not one of the 3 allowed values"
           if [ "$output" != "$expected" ]; then
             echo "::error::example output does not match the README/published output"
-            printf 'expected:\n%s\n' "$expected" | tr -d '\r'
-            printf 'actual:\n%s\n' "$output"
+            printf 'expected:\n%s\n' "$expected"
             exit 1
           fi
 
@@ -185,16 +139,19 @@ jobs:
   # packaging bug, so this lane exercises the manifest with the published tool.
   package:
     name: package-finn
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
       # finc links every program with `-lLLVM-22`, so a `-o` build needs that
       # library even when the program never calls LLVM. It ships in llvm-22-dev
-      # under /usr/lib/llvm-22/lib -- a directory the linker does not search by
-      # default -- while the `libllvm22` runtime package only provides
-      # libLLVM.so.22.1. Both are needed, and the directory must be passed.
+      # under /usr/lib/llvm-22/lib -- a directory ld does not search by default --
+      # while the `libllvm22` runtime package only provides libLLVM.so.22.1.
       - name: Install the LLVM link libraries
         run: |
           set -euo pipefail
@@ -211,11 +168,11 @@ jobs:
           printf 'FIN_LDFLAGS=-L/usr/lib/llvm-22/lib -Wl,--as-needed -lLLVM-22 -lm\n' >> "$GITHUB_ENV"
           test -e /usr/lib/llvm-22/lib/libLLVM-22.so
 
-      - name: Install pinned finc
+      - name: Install the pinned finc
         run: |
           set -euo pipefail
-          python3 .github/scripts/install_finc.py
-          echo "${{ github.workspace }}/.finc/bin" >> "$GITHUB_PATH"
+          python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
+          echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
 
       - name: Require contract 3
         run: |
@@ -224,9 +181,7 @@ jobs:
           grep -q "contract 3" version.txt
 
       - name: Install finn
-        run: |
-          set -euo pipefail
-          cargo install --locked --git https://github.com/M1778/finn finn
+        run: cargo install --locked --git https://github.com/M1778/finn finn
 
       - name: finn test
         run: finn test
