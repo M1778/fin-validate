@@ -16,9 +16,9 @@ if (!r.ok) {
 ## Verification status
 
 Verified against **finc 1.0.0 (contract 3)** from the published release archive
-(`x86_64-unknown-linux-musl`), with its bundled standard library. Both test suites
-and the example compile, link and run; see [Testing](#testing) for the commands
-and their output.
+(`x86_64-unknown-linux-musl`), with its bundled standard library. All three test
+programs and the example compile, link and run; see [Testing](#testing) for the
+commands and their output.
 
 | Platform | Status |
 | --- | --- |
@@ -42,8 +42,8 @@ where the run happened.
 - Separates missing, empty and present values: a missing key fails only required
   fields; a present-but-empty value fails required fields and is skipped
   otherwise; unknown keys are ignored.
-- Never aborts on untrusted input. Integer overflow, malformed numbers, a 255-byte
-  email and an empty allowlist are validation errors, not crashes.
+- Never aborts on untrusted input. Integer overflow, malformed numbers, a
+  300-byte email and an empty allowlist are validation errors, not crashes.
 - Reuses a schema and a result across requests with `schema_check_into`, which
   replaces previous errors instead of appending.
 
@@ -296,8 +296,9 @@ and repeated disposal. `tests/test_reuse.fin` is the consumer-shaped reuse path.
 CI fetches the pinned release in [`FINC_VERSION`](FINC_VERSION) through
 [`.github/scripts/install_finc.py`](.github/scripts/install_finc.py), which
 verifies the published SHA-256 and refuses on a mismatch, on a release with no
-artifact for the host triple, or on a compiler that does not report
-`contract 3`.
+artifact for the host triple, or on an archive that does not contain a working
+`bin/finc` and `lib/std`. The installer checks that the compiler reports *some*
+contract integer; the workflow then requires `contract 3` explicitly.
 
 ## License
 
