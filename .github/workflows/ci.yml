@@ -30,29 +30,91 @@ jobs:
       matrix:
         include:
           # The installer picks the host triple, so no triple is listed here.
+          #
+          # The published macOS and Linux-gnu archives link libLLVM dynamically,
+          # so a lane needs LLVM 22 installed too. Homebrew publishes llvm@22 for
+          # Apple Silicon only (no x86_64 bottle), so an Intel macOS runner cannot
+          # run the x86_64 artifact; that absence is a property of the release, and
+          # `macos-legacy` compiles the source instead so Intel coverage exists
+          # rather than silently disappearing. Everywhere else installs LLVM 22
+          # and runs the release artifact.
           - name: linux-x86_64
             runner: ubuntu-24.04
+            llvm: apt
           - name: linux-arm64
             runner: ubuntu-24.04-arm
+            llvm: apt
           - name: macos-arm64
             runner: macos-15
-          - name: macos-x86_64
+            llvm: brew
+          - name: macos-legacy
             runner: macos-15-intel
+            finc: source
           - name: windows-x86_64
             runner: windows-2022
             exe: .exe
     steps:
       - uses: actions/checkout@v4
 
+      # The release archive links libLLVM dynamically on Linux and macOS, so the
+      # runtime has to be present before finc can run at all. Pinned to the major
+      # the release was built against; a mismatch fails at `finc --version`
+      # rather than producing confusing downstream errors.
+      - name: Install LLVM 22 (Linux)
+        if: matrix.llvm == 'apt'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/$codename/ llvm-toolchain-$codename-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm22.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libllvm22
+          sudo ldconfig
+
+      - name: Install LLVM 22 (macOS)
+        if: matrix.llvm == 'brew'
+        run: |
+          set -euo pipefail
+          brew install llvm@22
+
       # The release archive carries bin/finc and lib/std, and finc finds its
       # standard library relative to its own binary, so no --fin-libs is needed.
       # The installer verifies the published SHA-256 and refuses an artifact it
       # cannot verify.
       - name: Install pinned finc
+        if: matrix.finc != 'source'
         run: |
           set -euo pipefail
           python3 .github/scripts/install_finc.py
           echo "${{ github.workspace }}/.finc/bin" >> "$GITHUB_PATH"
+
+      # finc links generated programs with clang, which on Windows needs the
+      # Visual Studio SDK libraries from a Developer shell. Without this the
+      # compiler runs but every `-o` build fails at the link step.
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+
+      - name: Report the linker driver
+        if: runner.os == 'Windows'
+        run: |
+          clang --version | head -1
+
+      # Only the lane whose published artifact cannot run does this. It is slow,
+      # so it is one lane, and it is honest about being a source build rather
+      # than pretending the release artifact worked.
+      - name: Build finc from source (legacy lane)
+        if: matrix.finc == 'source'
+        run: |
+          set -euo pipefail
+          brew install llvm@22 cmake ninja bison flex
+          git clone --depth 1 --branch v1.0.0 https://github.com/M1778/Fin.git "$RUNNER_TEMP/Fin"
+          cd "$RUNNER_TEMP/Fin"
+          export PATH="$(brew --prefix llvm@22)/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          ls CMakeUserPresets.json 2>/dev/null && rm -f CMakeUserPresets.json
+          ./build.sh --release --no-test
+          echo "$RUNNER_TEMP/Fin/build" >> "$GITHUB_PATH"
 
       - name: Require contract 3
         run: |

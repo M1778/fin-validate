@@ -106,6 +106,23 @@ def unpack(archive: Path, dest: Path) -> None:
             tf.extractall(dest)
 
 
+def expose_on_path(bin_dir: Path) -> None:
+    """Put `bin_dir` on PATH for later GitHub Actions steps.
+
+    The workflow-file command for this is `$GITHUB_PATH`, a file the runner appends to.
+    The older `::add-path::` workflow command is refused outright by current runners
+    ("The `add-path` command is disabled"), so printing it fails the job instead of
+    configuring it. When there is no `$GITHUB_PATH` -- a local run -- say where the
+    binary is and change nothing.
+    """
+    github_path = os.environ.get("GITHUB_PATH")
+    if github_path:
+        with open(github_path, "a", encoding="utf-8") as handle:
+            handle.write(f"{bin_dir}\n")
+    else:
+        print(f"finc is at {bin_dir}; add it to PATH to use it")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", help="defaults to the FINC_VERSION file")
@@ -134,7 +151,7 @@ def main() -> int:
         )
         if out.returncode == 0:
             print(f"finc already installed: {out.stdout.strip()}")
-            print(f"::add-path::{dest / 'bin'}")
+            expose_on_path(dest / "bin")
             return 0
         print("cached finc does not answer --version; reinstalling", file=sys.stderr)
 
@@ -240,8 +257,7 @@ def main() -> int:
         )
         return 1
 
-    # GitHub Actions picks this up; harmless elsewhere.
-    print(f"::add-path::{dest / 'bin'}")
+    expose_on_path(dest / "bin")
     return 0
 
 
