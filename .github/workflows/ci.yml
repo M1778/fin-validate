@@ -2,68 +2,134 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, production/hardening]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # bash on every runner, Windows included, so each step is one script rather
+    # than one per operating system. Windows runners ship Git Bash.
+    shell: bash
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      # Every platform reports: "which platforms are broken" is the question.
+      fail-fast: false
+      matrix:
+        include:
+          # The installer picks the host triple, so no triple is listed here.
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: macos-arm64
+            runner: macos-15
+          - name: macos-x86_64
+            runner: macos-15-intel
+          - name: windows-x86_64
+            runner: windows-2022
+            exe: .exe
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools
+      # The release archive carries bin/finc and lib/std, and finc finds its
+      # standard library relative to its own binary, so no --fin-libs is needed.
+      # The installer verifies the published SHA-256 and refuses an artifact it
+      # cannot verify.
+      - name: Install pinned finc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake ninja-build bison flex python3 pipx clang gpg curl git
-          pipx install conan
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          python3 .github/scripts/install_finc.py
+          echo "${{ github.workspace }}/.finc/bin" >> "$GITHUB_PATH"
 
-      - name: Install LLVM 22
+      - name: Require contract 3
         run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo tee /usr/share/keyrings/llvm-archive-keyring.gpg > /dev/null
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm22.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq llvm-22-dev clang-22 libllvm22
+          set -euo pipefail
+          finc --version | tee version.txt
+          grep -q "contract 3" version.txt
 
-      - name: Restore finc toolchain cache
-        id: finc-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
+      # A type-check is not a test. Every script below builds an executable and
+      # runs it; a nonzero program exit fails the job.
+      - name: Type-check the library
+        run: finc src/validate.fin
 
-      - name: Build finc (on cache miss)
-        if: steps.finc-restore.outputs.cache-hit != 'true'
+      - name: Baseline and ownership tests
         run: |
-          export PATH="$HOME/.local/bin:/usr/lib/llvm-22/bin:$PATH"
-          git clone --depth 1 https://github.com/M1778/Fin.git /tmp/Fin
-          cd /tmp/Fin && ./build.sh --release --no-test
+          set -euo pipefail
+          finc tests/test_validate.fin -I src -o "test_validate${{ matrix.exe }}"
+          "./test_validate${{ matrix.exe }}"
 
-      - name: Save finc toolchain cache
-        if: steps.finc-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
-
-      - name: finc version
+      - name: Boundary tests
         run: |
-          echo "/tmp/Fin/build" >> "$GITHUB_PATH"
-          /tmp/Fin/build/finc --version
+          set -euo pipefail
+          finc tests/test_boundaries.fin -I src -o "test_boundaries${{ matrix.exe }}"
+          "./test_boundaries${{ matrix.exe }}"
 
-      - name: Frontend check
+      - name: Reuse tests
         run: |
-          finc src/validate.fin
+          set -euo pipefail
+          finc tests/test_reuse.fin -I src -o "test_reuse${{ matrix.exe }}"
+          "./test_reuse${{ matrix.exe }}"
 
-      - name: Build and run tests
+      - name: Example
         run: |
-          finc tests/test_validate.fin -I src -o test_validate && ./test_validate
+          set -euo pipefail
+          finc examples/basic.fin -I src -o "example_basic${{ matrix.exe }}"
+          output="$("./example_basic${{ matrix.exe }}")"
+          printf '%s\n' "$output"
+          expected="signup rejected, 4 problem(s):
+            - field 'username' is too short: 2 bytes, minimum 3
+            - field 'email' is not a valid email address: expected local@domain.tld, letters-only TLD of at least 2
+            - field 'age' is above the maximum: 200, maximum 120
+            - field 'role' is not one of the 3 allowed values"
+          if [ "$output" != "$expected" ]; then
+            echo "::error::example output does not match the README/published output"
+            exit 1
+          fi
 
-      - name: Build and run example
+  # `finn` is the real package manager; a finn.toml it cannot consume is a
+  # packaging bug, so this lane exercises the manifest with the published tool.
+  package:
+    name: package-finn
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned finc
         run: |
-          finc examples/basic.fin -I src -o example_basic && ./example_basic
+          set -euo pipefail
+          python3 .github/scripts/install_finc.py
+          echo "${{ github.workspace }}/.finc/bin" >> "$GITHUB_PATH"
+
+      - name: Require contract 3
+        run: |
+          set -euo pipefail
+          finc --version | tee version.txt
+          grep -q "contract 3" version.txt
+
+      - name: Install finn
+        run: |
+          set -euo pipefail
+          cargo install --locked --git https://github.com/M1778/finn finn
+
+      - name: finn test
+        run: finn test
+
+      - name: finn do check
+        run: finn do check
+
+      - name: finn do example
+        run: finn do example
