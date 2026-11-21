@@ -1,27 +1,4 @@
 #!/usr/bin/env python3
-# =============================================================================
-# Fin Programming Language
-#
-# Made with ❤️ for someone special.
-#
-# This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
-# Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
-# Fin is the name of the Angel from BlackNightmare-Stories not yet published.
-# “Love is the reason this project exists”
-# -----------------------------------------------------------------------------
-# Author: M1778
-# Repository: https://github.com/M1778/fin-validate
-# Profile: https://github.com/M1778M/
-# -----------------------------------------------------------------------------
-# Copyright (C) 2027 M1778
-#
-# This file is part of fin-validate, a project for the Fin Programming Language.
-#
-# Licensed under the MIT License. See LICENSE in the repository root.
-#
-# SPDX-License-Identifier: MIT
-# =============================================================================
-
 """Install a pinned finc release without building the compiler from source.
 
 WHY THIS IS A SCRIPT AND NOT INLINE YAML
@@ -106,21 +83,24 @@ def unpack(archive: Path, dest: Path) -> None:
             tf.extractall(dest)
 
 
-def expose_on_path(bin_dir: Path) -> None:
-    """Put `bin_dir` on PATH for later GitHub Actions steps.
+def emit_path(bin_dir: Path) -> None:
+    """Tell the caller where the compiler went, in the form each context reads.
 
-    The workflow-file command for this is `$GITHUB_PATH`, a file the runner appends to.
-    The older `::add-path::` workflow command is refused outright by current runners
-    ("The `add-path` command is disabled"), so printing it fails the job instead of
-    configuring it. When there is no `$GITHUB_PATH` -- a local run -- say where the
-    binary is and change nothing.
+    `::add-path::` is a GitHub Actions workflow command that was retired years ago: it is no
+    longer honoured, and it is no longer even a known command, so printing it into `$GITHUB_ENV`
+    -- which is what a bare `print` in a step does -- puts a line in that file with no `NAME=VALUE`
+    in it and fails the step. Three repositories hit that and worked around it locally.
+
+    When `GITHUB_PATH` is set, append the directory to it, which is the current mechanism.
+    Otherwise print the directory for a human or a shell to use.
     """
-    github_path = os.environ.get("GITHUB_PATH")
-    if github_path:
-        with open(github_path, "a", encoding="utf-8") as handle:
-            handle.write(f"{bin_dir}\n")
+    target = os.environ.get("GITHUB_PATH")
+    if target:
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(str(bin_dir) + "\n")
+        print(f"added {bin_dir} to $GITHUB_PATH")
     else:
-        print(f"finc is at {bin_dir}; add it to PATH to use it")
+        print(str(bin_dir))
 
 
 def main() -> int:
@@ -151,7 +131,7 @@ def main() -> int:
         )
         if out.returncode == 0:
             print(f"finc already installed: {out.stdout.strip()}")
-            expose_on_path(dest / "bin")
+            emit_path(dest / "bin")
             return 0
         print("cached finc does not answer --version; reinstalling", file=sys.stderr)
 
@@ -257,7 +237,7 @@ def main() -> int:
         )
         return 1
 
-    expose_on_path(dest / "bin")
+    emit_path(dest / "bin")
     return 0
 
 
