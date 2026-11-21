@@ -106,23 +106,25 @@ jobs:
       # dylib no Intel runner has. Building the compiler from the v1.0.0 tag keeps
       # Intel coverage instead of dropping the lane and calling it covered.
       #
-      # The compiler's own setup action is used rather than a local copy of its
-      # recipe, so the LLVM pin, conan profile and bison/flex setup cannot drift
-      # from the tag being built. A local action must live inside the workspace,
-      # which is why the compiler is cloned into it and removed again afterwards.
-      - name: Fetch the compiler source (legacy lane)
+      # The compiler's setup-toolchain action is not reused: it resolves
+      # CMakeLists.txt against the workspace root, so it cannot be run from
+      # another repository's checkout.
+      - name: Install the compiler's build dependencies (legacy lane)
         if: matrix.finc == 'source'
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch v1.0.0 https://github.com/M1778/Fin.git .fin-src
-
-      - uses: ./.fin-src/.github/actions/setup-toolchain
-        if: matrix.finc == 'source'
+          brew install llvm@22 cmake ninja bison flex conan
+          {
+            echo "PATH=$(brew --prefix llvm@22)/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+            echo "CC=$(brew --prefix llvm@22)/bin/clang"
+            echo "CXX=$(brew --prefix llvm@22)/bin/clang++"
+          } >> "$GITHUB_ENV"
 
       - name: Build finc from source (legacy lane)
         if: matrix.finc == 'source'
         run: |
           set -euo pipefail
+          git clone --depth 1 --branch v1.0.0 https://github.com/M1778/Fin.git .fin-src
           cd .fin-src
           rm -f CMakeUserPresets.json
           ./build.sh --release --no-test
