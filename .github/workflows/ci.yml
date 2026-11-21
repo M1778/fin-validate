@@ -101,20 +101,32 @@ jobs:
         run: |
           clang --version | head -1
 
-      # Only the lane whose published artifact cannot run does this. It is slow,
-      # so it is one lane, and it is honest about being a source build rather
-      # than pretending the release artifact worked.
+      # Only the lane whose published artifact cannot run does this. Homebrew
+      # publishes llvm@22 for Apple Silicon only, so the x86_64 archive links a
+      # dylib no Intel runner has. Building the compiler from the v1.0.0 tag keeps
+      # Intel coverage instead of dropping the lane and calling it covered.
+      #
+      # The compiler's own setup action is used rather than a local copy of its
+      # recipe, so the LLVM pin, conan profile and bison/flex setup cannot drift
+      # from the tag being built. A local action must live inside the workspace,
+      # which is why the compiler is cloned into it and removed again afterwards.
+      - name: Fetch the compiler source (legacy lane)
+        if: matrix.finc == 'source'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.0.0 https://github.com/M1778/Fin.git .fin-src
+
+      - uses: ./.fin-src/.github/actions/setup-toolchain
+        if: matrix.finc == 'source'
+
       - name: Build finc from source (legacy lane)
         if: matrix.finc == 'source'
         run: |
           set -euo pipefail
-          brew install llvm@22 cmake ninja bison flex
-          git clone --depth 1 --branch v1.0.0 https://github.com/M1778/Fin.git "$RUNNER_TEMP/Fin"
-          cd "$RUNNER_TEMP/Fin"
-          export PATH="$(brew --prefix llvm@22)/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
-          ls CMakeUserPresets.json 2>/dev/null && rm -f CMakeUserPresets.json
+          cd .fin-src
+          rm -f CMakeUserPresets.json
           ./build.sh --release --no-test
-          echo "$RUNNER_TEMP/Fin/build" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/.fin-src/build" >> "$GITHUB_PATH"
 
       - name: Require contract 3
         run: |
@@ -149,7 +161,11 @@ jobs:
         run: |
           set -euo pipefail
           finc examples/basic.fin -I src -o "example_basic${{ matrix.exe }}"
-          output="$("./example_basic${{ matrix.exe }}")"
+          # The program writes through the C runtime, which opens stdout in text
+          # mode on Windows and turns every "\n" into "\r\n". Compare with the
+          # carriage returns removed so the assertion is about the message, not
+          # the host's newline convention.
+          output="$("./example_basic${{ matrix.exe }}" | tr -d '\r')"
           printf '%s\n' "$output"
           expected="signup rejected, 4 problem(s):
             - field 'username' is too short: 2 bytes, minimum 3
@@ -158,6 +174,8 @@ jobs:
             - field 'role' is not one of the 3 allowed values"
           if [ "$output" != "$expected" ]; then
             echo "::error::example output does not match the README/published output"
+            printf 'expected:\n%s\n' "$expected" | tr -d '\r'
+            printf 'actual:\n%s\n' "$output"
             exit 1
           fi
 
