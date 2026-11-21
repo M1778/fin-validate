@@ -1,6 +1,6 @@
 [project]
 name = "fin-validate"
-version = "0.1.1"
+version = "0.2.0"
 envpath = ".finn"
 entrypoint = "validate.fin"
 
@@ -8,4 +8,5 @@ entrypoint = "validate.fin"
 
 [scripts]
 check = "finc src/validate.fin"
-test = "finc tests/test_validate.fin -I src -o test_validate && ./test_validate"
+test = "finc tests/test_validate.fin -I src -o test_validate && ./test_validate && finc tests/test_boundaries.fin -I src -o test_boundaries && ./test_boundaries && finc tests/test_reuse.fin -I src -o test_reuse && ./test_reuse"
+example = "finc examples/basic.fin -I src -o basic && ./basic"
