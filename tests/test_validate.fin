@@ -350,6 +350,41 @@ fun main() <noret> {
     assert_true(!r8.ok, "short username should fail");
     assert_true(equals(error_at(&r8, 0).message, "field 'username' is too short"), "min_len message");
 
+    // 8b. username too long, and the exact boundary on both sides.
+    //
+    // This was missing, and a mutation that added 100 to max_len passed the whole suite.
+    // min_len had a test and max_len did not, so the upper bound of a validation library
+    // was never exercised -- the one thing an upper bound exists for. The three inputs
+    // below are 20 (the limit, must pass), 21 (one over, must fail) and 60 (well over,
+    // must fail and must still name the field).
+    let i8b <&Collection<&InputValue>> = valid_input();
+    input_set(i8b, "username", repeat("a", 20));
+    let r8b <ValidationResult> = schema_check(&s, i8b);
+    assert_true(r8b.ok, "username of exactly max_len (20) must be accepted");
+
+    let i8c <&Collection<&InputValue>> = valid_input();
+    input_set(i8c, "username", repeat("a", 21));
+    let r8c <ValidationResult> = schema_check(&s, i8c);
+    assert_true(!r8c.ok, "username of max_len + 1 (21) must be rejected");
+    assert_true(equals(error_at(&r8c, 0).message, "field 'username' is too long"), "max_len message");
+
+    let i8d <&Collection<&InputValue>> = valid_input();
+    input_set(i8d, "username", repeat("a", 60));
+    let r8d <ValidationResult> = schema_check(&s, i8d);
+    assert_true(!r8d.ok, "username far over max_len must be rejected");
+    assert_true(equals(error_at(&r8d, 0).message, "field 'username' is too long"), "max_len message at 60");
+
+    // 8e. A field declared with no upper bound (-1) must accept any length.
+    // Without this, "max_len < 0 means unlimited" is an assumption rather than a fact.
+    let unbounded <Schema> = new_schema();
+    add_string_field(&unbounded, "note", true, -1, -1);
+    let i8e <&Collection<&InputValue>> = new_input();
+    input_set(i8e, "note", repeat("x", 5000));
+    let r8e <ValidationResult> = schema_check(&unbounded, i8e);
+    assert_true(r8e.ok, "max_len -1 must mean no upper bound");
+    schema_dispose(&unbounded);
+    result_clear(&r8e);
+
     // 9. custom validator rejects odd-length code
     let i9 <&Collection<&InputValue>> = valid_input();
     input_set(i9, "code", "abc");
