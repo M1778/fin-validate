@@ -24,8 +24,12 @@ and sanitizer builds without `-g` run successfully.
 With [finn](https://github.com/M1778/finn) (once the registry resolves bare names):
 
 ```sh
-finn add M1778/fin-validate
+finn add --yes M1778/fin-validate
 ```
+
+No registry resolves these names yet, so `--yes` is required: without it `finn add` refuses
+a source the register has not vouched for rather than installing it unasked. Drop the flag
+once a registry entry exists.
 
 Manual (today):
 
