@@ -1,0 +1,83 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/fin-validate
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of fin-validate, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
+// A consumer-shaped integration test: build one schema, validate many requests
+// through it with schema_check_into, and dispose once. This is the reuse pattern
+// the README recommends, exercised end to end rather than asserted about.
+//
+// Run: finc tests/test_reuse.fin -I src -o test_reuse && ./test_reuse
+
+import { new_schema, add_string_field, add_email_field, add_int_range_field, new_input, input_set, input_clear, schema_check_into, new_result, schema_dispose, result_clear, result_dispose, error_count, error_at, Schema, ValidationResult, InputValue } from validate::fin;
+import { Collection } from collection::std;
+import { equals } from strings::std;
+
+fun main() <noret> {
+    let s <Schema> = new_schema();
+    add_string_field(&s, "username", true, 3, 20);
+    add_email_field(&s, "email", true);
+    add_int_range_field(&s, "age", false, true, 13, true, 120);
+
+    let form <&Collection<&InputValue>> = new_input();
+    let r <ValidationResult> = new_result();
+
+    // 1. A good request passes and leaves no stale errors from a previous one.
+    input_set(form, "username", "eleanor_1");
+    input_set(form, "email", "eleanor@example.com");
+    input_set(form, "age", "27");
+    schema_check_into(&s, form, &r);
+    blame r.ok, "valid request passes";
+    blame error_count(&r) == 0, "valid request has no errors";
+
+    // 2. Three simultaneous failures: one error per broken field, in schema order.
+    input_set(form, "username", "el");
+    input_set(form, "email", "nope");
+    input_set(form, "age", "9");
+    schema_check_into(&s, form, &r);
+    blame !r.ok, "invalid request fails";
+    blame error_count(&r) == 3, "one error per failing field";
+    blame equals(error_at(&r, 0).field, "username"), "first error is username";
+    blame equals(error_at(&r, 1).field, "email"), "second error is email";
+    blame equals(error_at(&r, 2).field, "age"), "third error is age";
+    blame equals(error_at(&r, 2).message, "field 'age' is below the minimum: 9, minimum 13"), "age error is actionable";
+
+    // 3. Reuse: a fixed request clears the previous errors rather than appending.
+    input_set(form, "username", "eleanor_1");
+    input_set(form, "email", "eleanor@example.com");
+    input_set(form, "age", "28");
+    schema_check_into(&s, form, &r);
+    blame r.ok && error_count(&r) == 0, "fixed request clears earlier errors";
+
+    // 4. Clearing and reusing handles is safe and starts clean.
+    result_clear(&r);
+    blame r.ok && error_count(&r) == 0, "result_clear resets ok and errors";
+    input_clear(form);
+    schema_check_into(&s, form, &r);
+    blame !r.ok && error_count(&r) == 2, "empty input fails the two required fields";
+
+    result_dispose(&r);
+    schema_dispose(&s);
+    input_clear(form);
+    form.free_collection();
+    delete form;
+    printf("all fin-validate reuse tests passed\n");
+}

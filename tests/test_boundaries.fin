@@ -1,0 +1,460 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/fin-validate
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of fin-validate, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
+// Every validator at its exact boundary: the shortest accepted input, the
+// shortest rejected input, the maximum, the minimum, empty input, and one byte
+// over the limit. A rule whose boundary is untested is a rule that will accept
+// the wrong thing in production.
+//
+// Run: finc tests/test_boundaries.fin -I src -o test_boundaries && ./test_boundaries
+
+import { new_schema, add_string_field, add_email_field, add_int_range_field, add_float_field, add_bool_field, add_one_of_field, add_custom_field, new_input, input_set, input_clear, schema_check, schema_check_into, schema_clear, schema_dispose, result_dispose, error_count, error_at, Schema, ValidationResult, InputValue } from validate::fin;
+import { Collection } from collection::std;
+import { equals, find, len, repeat, concat, free_str } from strings::std;
+
+// A rejection must name the rule that failed, not merely that something did.
+struct Case {
+    value <string>,
+    valid <bool>,
+    message <string?>,
+}
+
+fun fail(label: string, want: string, got: string) <noret> {
+    printf("FAIL %s\n  want <%s>\n  got  <%s>\n", label, want, got);
+    blame false, label;
+}
+
+// One field named "v", one probe per table row. Exactly one error is required on
+// a rejection so a row cannot pass because an unrelated rule also fired.
+fun expect_cases(s: &Schema, input: &Collection<&InputValue>, label: string, cases: [Case]) <noret> {
+    foreach (c <Case> in cases) {
+        input_set(input, "v", c.value);
+        let r <ValidationResult> = schema_check(s, input);
+        if (r.ok != c.valid) {
+            printf("FAIL %s value=<%s> expected ok=%d got ok=%d\n", label, c.value, c.valid, r.ok);
+            blame r.ok == c.valid, label;
+        }
+        if (c.message != null) {
+            if (error_count(&r) != 1) {
+                printf("FAIL %s value=<%s> expected 1 error, got %d\n", label, c.value, error_count(&r));
+                blame error_count(&r) == 1, label;
+            }
+            let want <string> = c.message?;
+            if (!equals(error_at(&r, 0).message, want)) {
+                fail(label, want, error_at(&r, 0).message);
+            }
+        }
+        result_dispose(&r);
+    }
+}
+
+fun test_string_length_boundaries() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    add_string_field(&s, "v", true, 3, 5);
+    // Minimum 3: shortest accepted, shortest rejected, empty.
+    expect_cases(&s, input, "string min=3", [
+        Case{value: "abc", valid: true},
+        Case{value: "ab", valid: false, message: "field 'v' is too short: 2 bytes, minimum 3"},
+        Case{value: "a", valid: false, message: "field 'v' is too short: 1 bytes, minimum 3"},
+        Case{value: "", valid: false, message: "field 'v' is required"}
+    ]);
+    // Maximum 5: longest accepted, one byte over.
+    expect_cases(&s, input, "string max=5", [
+        Case{value: "abcde", valid: true},
+        Case{value: "abcdef", valid: false, message: "field 'v' is too long: 6 bytes, maximum 5"}
+    ]);
+    // Length is bytes, not characters: a 2-byte UTF-8 sequence is 2 bytes.
+    expect_cases(&s, input, "string bytes", [
+        Case{value: "é", valid: false, message: "field 'v' is too short: 2 bytes, minimum 3"}
+    ]);
+    schema_dispose(&s);
+
+    // An optional field skips validation when absent or empty, but still
+    // applies its bounds to a present, nonempty value.
+    let o <Schema> = new_schema();
+    add_string_field(&o, "v", false, 3, 5);
+    expect_cases(&o, input, "optional string", [
+        Case{value: "", valid: true},
+        Case{value: "ab", valid: false, message: "field 'v' is too short: 2 bytes, minimum 3"},
+        Case{value: "abcdef", valid: false, message: "field 'v' is too long: 6 bytes, maximum 5"},
+        Case{value: "abc", valid: true}
+    ]);
+    schema_dispose(&o);
+
+    // -1 disables a bound; the other bound still applies.
+    let d <Schema> = new_schema();
+    add_string_field(&d, "v", true, -1, 4);
+    let big <string> = repeat("x", 5000);
+    expect_cases(&d, input, "disabled min", [
+        Case{value: "a", valid: true},
+        Case{value: "abcd", valid: true},
+        Case{value: "abcde", valid: false, message: "field 'v' is too long: 5 bytes, maximum 4"},
+        Case{value: big, valid: false, message: "field 'v' is too long: 5000 bytes, maximum 4"}
+    ]);
+    free_str(big);
+    schema_dispose(&d);
+
+    // max_len = 0 admits only the empty string, which a required field refuses.
+    let z <Schema> = new_schema();
+    add_string_field(&z, "v", false, 0, 0);
+    expect_cases(&z, input, "max=0", [
+        Case{value: "", valid: true},
+        Case{value: "x", valid: false, message: "field 'v' is too long: 1 bytes, maximum 0"}
+    ]);
+    schema_dispose(&z);
+
+    input_clear(input);
+    delete input;
+}
+
+fun test_email_boundaries() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    add_email_field(&s, "v", true);
+    // Shortest shapes at each rule, then every malformed shape the previous
+    // implementation accepted.
+    expect_cases(&s, input, "email", [
+        Case{value: "a@b.co", valid: true},
+        Case{value: "a@b.c", valid: false, message: null},
+        Case{value: "a@b", valid: false, message: null},
+        Case{value: "@b.com", valid: false, message: null},
+        Case{value: "a@", valid: false, message: null},
+        Case{value: "a@@b.com", valid: false, message: null},
+        Case{value: "a@b..com", valid: false, message: null},
+        Case{value: "a@.b.com", valid: false, message: null},
+        Case{value: "a@b.com.", valid: false, message: null},
+        Case{value: ".a@b.com", valid: false, message: null},
+        Case{value: "a.@b.com", valid: false, message: null},
+        Case{value: "a..b@c.com", valid: false, message: null},
+        Case{value: "a@-b.com", valid: false, message: null},
+        Case{value: "a@b-.com", valid: false, message: null},
+        Case{value: "a@b.co-", valid: false, message: null},
+        Case{value: "a@b.-com", valid: false, message: null},
+        Case{value: "a@b.c0", valid: false, message: null},
+        Case{value: "a@b.c-d", valid: false, message: null},
+        Case{value: "a b@c.com", valid: false, message: null},
+        Case{value: " a@b.com", valid: false, message: null},
+        Case{value: "a@b.com ", valid: false, message: null},
+        Case{value: "a@b_c.com", valid: false, message: null},
+        // Deliberately accepted: a practical subset, not RFC 5322.
+        Case{value: "A.B+c%d_e-f@sub.example.co.uk", valid: true},
+        Case{value: "a@b.cc", valid: true}
+    ]);
+
+    // Local part: 64 bytes accepted, 65 rejected.
+    let loc64 <string> = repeat("a", 64);
+    let loc65 <string> = repeat("a", 65);
+    let e64 <string> = concat(loc64, "@b.com");
+    let e65 <string> = concat(loc65, "@b.com");
+    expect_cases(&s, input, "email local length", [
+        Case{value: e64, valid: true},
+        Case{value: e65, valid: false, message: null}
+    ]);
+
+    // Domain label: 63 bytes accepted, 64 rejected.
+    let d63 <string> = repeat("d", 63);
+    let d64 <string> = repeat("d", 64);
+    let label63 <string> = concat(concat("a@", d63), ".com");
+    let label64 <string> = concat(concat("a@", d64), ".com");
+    expect_cases(&s, input, "email label length", [
+        Case{value: label63, valid: true},
+        Case{value: label64, valid: false, message: null}
+    ]);
+
+    // Total length: 254 bytes accepted, 255 rejected.
+    let tld61 <string> = repeat("e", 61);
+    let tld62 <string> = repeat("e", 62);
+    let dom254 <string> = concat(concat(concat(d63, "."), d63), concat(".", tld61));
+    let dom255 <string> = concat(concat(concat(d63, "."), d63), concat(".", tld62));
+    let e254 <string> = concat(concat(loc64, "@"), dom254);
+    let e255 <string> = concat(concat(loc64, "@"), dom255);
+    blame len(e254) == 254, "fixture is 254 bytes";
+    blame len(e255) == 255, "fixture is 255 bytes";
+    expect_cases(&s, input, "email total length", [
+        Case{value: e254, valid: true},
+        Case{value: e255, valid: false, message: null}
+    ]);
+
+    // Rejections must say which rule failed, not just that one did.
+    input_set(input, "v", "not-an-email");
+    let r <ValidationResult> = schema_check(&s, input);
+    blame error_count(&r) == 1, "one email error";
+    let msg <string> = error_at(&r, 0).message;
+    blame equals(msg, "field 'v' is not a valid email address: expected local@domain.tld, letters-only TLD of at least 2"), "email message names the rule";
+    result_dispose(&r);
+
+    free_str(loc64); free_str(loc65); free_str(e64); free_str(e65);
+    free_str(d63); free_str(d64); free_str(label63); free_str(label64);
+    free_str(tld61); free_str(tld62); free_str(dom254); free_str(dom255);
+    free_str(e254); free_str(e255);
+    schema_dispose(&s);
+    input_clear(input);
+    delete input;
+}
+
+fun test_int_range_boundaries() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    add_int_range_field(&s, "v", true, true, 13, true, 120);
+    expect_cases(&s, input, "int [13,120]", [
+        Case{value: "13", valid: true},
+        Case{value: "120", valid: true},
+        Case{value: "12", valid: false, message: "field 'v' is below the minimum: 12, minimum 13"},
+        Case{value: "121", valid: false, message: "field 'v' is above the maximum: 121, maximum 120"},
+        Case{value: "", valid: false, message: "field 'v' is required"},
+        Case{value: "1.0", valid: false, message: "field 'v' must be an integer: optional minus, then decimal digits within int32"},
+        Case{value: " 13", valid: false, message: null},
+        Case{value: "13 ", valid: false, message: null},
+        Case{value: "+13", valid: false, message: null},
+        Case{value: "-", valid: false, message: null},
+        Case{value: "1e2", valid: false, message: null},
+        Case{value: "13a", valid: false, message: null}
+    ]);
+    // Exact int32 endpoints: no float rounding anywhere in this path.
+    schema_clear(&s);
+    add_int_range_field(&s, "v", true, true, -2147483647 - 1, true, 2147483647);
+    expect_cases(&s, input, "int32 endpoints", [
+        Case{value: "2147483647", valid: true},
+        Case{value: "-2147483648", valid: true},
+        Case{value: "2147483648", valid: false, message: "field 'v' must be an integer: optional minus, then decimal digits within int32"},
+        Case{value: "-2147483649", valid: false, message: null},
+        Case{value: "99999999999999999999999999999999", valid: false, message: null},
+        Case{value: "0", valid: true},
+        Case{value: "0000000000000000000000002147483647", valid: true}
+    ]);
+    // Disabled bounds are ignored even when their stored value is nonsense.
+    schema_clear(&s);
+    add_int_range_field(&s, "v", true, false, 100, false, -100);
+    expect_cases(&s, input, "int bounds disabled", [
+        Case{value: "-2147483648", valid: true},
+        Case{value: "2147483647", valid: true}
+    ]);
+    schema_dispose(&s);
+    input_clear(input);
+    delete input;
+}
+
+fun test_float_boundaries() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    add_float_field(&s, "v", true, true, 0.5, true, 2.8);
+    expect_cases(&s, input, "float [0.5,2.8]", [
+        Case{value: "0.5", valid: true},
+        Case{value: "2.8", valid: true},
+        Case{value: "0.4", valid: false, message: "field 'v' is below the minimum: 0.4, minimum 0.5"},
+        Case{value: "2.9", valid: false, message: "field 'v' is above the maximum: 2.9, maximum 2.8"},
+        Case{value: ".5", valid: true},
+        Case{value: "1.", valid: true},
+        Case{value: "0.500", valid: true},
+        Case{value: "", valid: false, message: "field 'v' is required"},
+        Case{value: "1e3", valid: false, message: null},
+        Case{value: "+1", valid: false, message: null},
+        Case{value: ".", valid: false, message: null},
+        Case{value: "1.2.3", valid: false, message: null},
+        Case{value: "NaN", valid: false, message: null},
+        Case{value: "inf", valid: false, message: null}
+    ]);
+    // The message threshold, not just the accept/reject bit, must move.
+    schema_clear(&s);
+    add_float_field(&s, "v", true, true, -1.0, true, 1.0);
+    expect_cases(&s, input, "float [-1,1]", [
+        Case{value: "-1", valid: true},
+        Case{value: "1", valid: true},
+        Case{value: "-1.1", valid: false, message: null},
+        Case{value: "1.1", valid: false, message: null}
+    ]);
+    // Binary32 overflow is a validation error, not an accepted infinity.
+    schema_dispose(&s);
+    let big <Schema> = new_schema();
+    add_float_field(&big, "v", true, false, 0.0, false, 0.0);
+    let huge <string> = repeat("9", 400);
+    expect_cases(&big, input, "float overflow", [
+        Case{value: "340282346638528859811704183484516925440", valid: true},
+        Case{value: "340282400000000000000000000000000000000", valid: false, message: "field 'v' must be a number: optional minus, decimal digits, at most one dot, finite binary32"},
+        Case{value: huge, valid: false, message: null}
+    ]);
+    free_str(huge);
+    schema_dispose(&big);
+    input_clear(input);
+    delete input;
+}
+
+fun test_boolean_boundaries() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    add_bool_field(&s, "v", true);
+    expect_cases(&s, input, "bool", [
+        Case{value: "true", valid: true},
+        Case{value: "false", valid: true},
+        Case{value: "1", valid: true},
+        Case{value: "0", valid: true},
+        Case{value: "True", valid: false, message: "field 'v' must be a boolean: true, false, 1 or 0, lowercase"},
+        Case{value: "TRUE", valid: false, message: null},
+        Case{value: "yes", valid: false, message: null},
+        Case{value: " t", valid: false, message: null},
+        Case{value: "01", valid: false, message: null},
+        Case{value: "", valid: false, message: "field 'v' is required"}
+    ]);
+    schema_dispose(&s);
+    input_clear(input);
+    delete input;
+}
+
+fun test_allowlist_boundaries() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    let allowed <&Collection<string>> = new Collection::<string>{};
+    // No members: everything nonempty rejected, including an emptied-out
+    // mutation after the field was configured.
+    add_one_of_field(&s, "v", false, allowed);
+    expect_cases(&s, input, "allowlist empty", [
+        Case{value: "admin", valid: false, message: "field 'v' is not one of the 0 allowed values"}
+    ]);
+    allowed.push("admin");
+    allowed.push("user");
+    expect_cases(&s, input, "allowlist members", [
+        Case{value: "admin", valid: true},
+        Case{value: "user", valid: true},
+        Case{value: "Admin", valid: false, message: "field 'v' is not one of the 2 allowed values"},
+        Case{value: " admin", valid: false, message: null},
+        Case{value: "admin ", valid: false, message: null}
+    ]);
+    allowed.clear();
+    expect_cases(&s, input, "allowlist cleared", [
+        Case{value: "admin", valid: false, message: null}
+    ]);
+    // A null list is a closed list, not an open one.
+    schema_clear(&s);
+    add_one_of_field(&s, "v", false, null);
+    expect_cases(&s, input, "allowlist null", [
+        Case{value: "admin", valid: false, message: null}
+    ]);
+    schema_dispose(&s);
+    delete allowed;
+    input_clear(input);
+    delete input;
+}
+
+fun even_length(v: string) <bool> {
+    return len(v) % 2 == 0;
+}
+
+fun test_custom_boundaries() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    let check <fn(string) -> bool> = (v: string) <bool> => even_length(v);
+    add_custom_field(&s, "v", false, check, "code must have even length");
+    expect_cases(&s, input, "custom optional", [
+        Case{value: "", valid: true},
+        Case{value: "ab", valid: true},
+        Case{value: "a", valid: false, message: "code must have even length"}
+    ]);
+    // Custom message is the caller's, not this module's: it is reported verbatim
+    // and survives disposal, so the same literal can be reused for a second
+    // failing check. A module-owned copy would be freed by the first
+    // result_dispose and read as garbage here.
+    input_set(input, "v", "a");
+    let r <ValidationResult> = schema_check(&s, input);
+    blame !r.ok && error_count(&r) == 1, "custom field rejects odd length";
+    blame !error_at(&r, 0).owns_message, "custom message is borrowed";
+    result_dispose(&r);
+    schema_check_into(&s, input, &r);
+    blame !r.ok && error_count(&r) == 1, "custom field still rejects after result disposal";
+    blame equals(error_at(&r, 0).message, "code must have even length"), "borrowed custom message intact";
+    result_dispose(&r);
+    schema_dispose(&s);
+    input_clear(input);
+    delete input;
+}
+
+fun test_required_semantics() <noret> {
+    // A missing key fails only required fields; empty is distinct from absent.
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    add_string_field(&s, "req", true, -1, -1);
+    add_string_field(&s, "opt", false, -1, -1);
+    let r <ValidationResult> = schema_check(&s, input);
+    blame !r.ok && error_count(&r) == 1, "only the missing required field fails";
+    blame equals(error_at(&r, 0).field, "req"), "the required field is named";
+    blame equals(error_at(&r, 0).message, "field 'req' is required"), "required message";
+    result_dispose(&r);
+    input_set(input, "req", "");
+    input_set(input, "opt", "");
+    schema_check_into(&s, input, &r);
+    blame !r.ok && error_count(&r) == 1, "a present-but-empty required field still fails";
+    result_dispose(&r);
+    // Unknown keys are ignored, and a duplicate key replaces rather than appends.
+    input_set(input, "req", "ok");
+    input_set(input, "unknown", "surprise");
+    input_set(input, "unknown", "again");
+    schema_check_into(&s, input, &r);
+    blame r.ok && error_count(&r) == 0, "unknown keys ignored";
+    result_dispose(&r);
+    schema_dispose(&s);
+    input_clear(input);
+    delete input;
+}
+
+// A message must never echo the submitted value: a CR/LF or control byte in an
+// untrusted field would otherwise forge a line in whatever log prints the error.
+fun test_messages_do_not_echo_input() <noret> {
+    let s <Schema> = new_schema();
+    let input <&Collection<&InputValue>> = new_input();
+    add_email_field(&s, "email", true);
+    add_int_range_field(&s, "age", false, true, 1, true, 9);
+    add_string_field(&s, "name", false, 1, 3);
+    input_set(input, "email", "bad\nFAKE LOG LINE");
+    input_set(input, "age", "12\nFAKE");
+    input_set(input, "name", "abcdef\nFAKE");
+    let r <ValidationResult> = schema_check(&s, input);
+    blame error_count(&r) == 3, "one error per forged field";
+    for (let i <int> = 0; i < error_count(&r); i++) {
+        let message <string> = error_at(&r, i).message;
+        if (find(message, "\n") >= 0) {
+            printf("FAIL message contains a newline from input: <%s>\n", message);
+            blame false, "message echoes input";
+        }
+        if (find(message, "FAKE") >= 0) {
+            printf("FAIL message echoes input: <%s>\n", message);
+            blame false, "message echoes input";
+        }
+    }
+    result_dispose(&r);
+    schema_dispose(&s);
+    input_clear(input);
+    delete input;
+}
+
+fun main() <noret> {
+    test_string_length_boundaries();
+    test_email_boundaries();
+    test_int_range_boundaries();
+    test_float_boundaries();
+    test_boolean_boundaries();
+    test_allowlist_boundaries();
+    test_messages_do_not_echo_input();
+    test_custom_boundaries();
+    test_required_semantics();
+    printf("all fin-validate boundary tests passed\n");
+}

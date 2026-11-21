@@ -58,9 +58,11 @@ fun main() <noret> {
     }
     result_dispose(&r);
     schema_dispose(&s);
+    // input_clear frees the entry objects; free_collection then releases the
+    // Collection's buffer. Both are needed; `delete` only frees the handle.
     input_clear(form);
-    // Frozen Collection has no buffer-disposal API. Services should retain
-    // and reuse input/allowlist collections; delete frees only their headers.
+    form.free_collection();
     delete form;
+    roles.free_collection();
     delete roles;
 }

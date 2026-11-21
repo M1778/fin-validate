@@ -1,6 +1,32 @@
-// finn package-export placeholder, following `finn init --template library`.
-// NOTE (verified 2026-10-19): `export * from ...` is NOT valid Fin syntax —
-// the Fin grammar has no `export` keyword and finc will reject this file.
-// finn generates it anyway as an aspirational package-export convention.
-// Do NOT run finc on this file until finn/finc define the re-export syntax.
-export * from "src/validate";
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/fin-validate
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of fin-validate, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
+// finn library-template placeholder.
+//
+// `finn init --template library` writes `export * from "src/lib";`, but Fin's
+// grammar has no `export` keyword (finc: "syntax error, unexpected KW_FROM").
+// The file is kept only because `finn`'s package-layout check looks for it;
+// the real public surface is `src/validate.fin`. Do not compile this file.
+//
+// Consume the library with a quoted path import:
+//     import { new_schema } from "fin-validate/src/validate";

@@ -21,23 +21,19 @@
 // SPDX-License-Identifier: MIT
 // =============================================================================
 
-// SPDX-License-Identifier: MIT
 // Schema-driven validation of borrowed NUL-terminated input strings.
 // Invalid values return errors; caller programming errors (invalid error indices,
 // dangling pointers, aborting custom callbacks) are not recoverable here.
 
 #[stdimport] %{
 import { Collection } from collection::std;
-import { to_chars, concat, free_str, len, is_empty } from strings::std;
+import { to_chars, concat, free_str, len, is_empty, equals } from strings::std;
 }%
 
 namespace fin {
 
-#[llvm_name="strcmp"]
-@define valid_strcmp(a: string, b: string) <int>;
-
 priv fun str_eq(a: string, b: string) <bool> {
-    return valid_strcmp(a, b) == 0;
+    return equals(a, b);
 }
 
 // Type codes: 0=string, 1=int, 2=float, 3=bool, 4=email.
@@ -214,11 +210,20 @@ priv fun email_domain_char(c: char) <bool> {
     return c == '.' || c == '-';
 }
 
-// Practical (not RFC-5322-complete) email check: one @, dot in domain,
-// valid characters, TLD of at least 2 chars.
+// Practical (not RFC-5322-complete) email check: at most 254 bytes total, a
+// local part of at most 64 bytes without leading/trailing/doubled dots, and a
+// domain of nonempty dot-separated labels of at most 63 bytes each that start and
+// end alphanumerically, ending in a TLD of at least 2 ASCII letters. These are
+// the shape limits a mail transport applies; this checks shape only. It does not
+// prove the mailbox exists or that the domain resolves, and it is not a defense
+// against header injection.
 priv fun valid_email(s: string) <bool> {
     let cs <[char]> = to_chars(s);
     let n <int> = cs.length - 1;
+    if (n > 254) {
+        delete cs;
+        return false;
+    }
     let at <int> = -1;
     for (let i <int> = 0; i < n; i++) {
         if (cs[i] == '@') {
@@ -233,15 +238,7 @@ priv fun valid_email(s: string) <bool> {
             return false;
         }
     }
-    if (at <= 0 || at == n - 1) {
-        delete cs;
-        return false;
-    }
-    let dot <int> = -1;
-    for (let i <int> = at + 1; i < n; i++) {
-        if (cs[i] == '.') { dot = i; }
-    }
-    if (dot == -1 || dot == at + 1 || dot == n - 1 || n - dot - 1 < 2) {
+    if (at <= 0 || at > 64 || at == n - 1) {
         delete cs;
         return false;
     }
@@ -250,9 +247,40 @@ priv fun valid_email(s: string) <bool> {
             delete cs;
             return false;
         }
+        if (cs[i] == '.' && (i == 0 || cs[i - 1] == '.' || i == at - 1)) {
+            delete cs;
+            return false;
+        }
     }
+    // Each domain label is 1..63 bytes and alphanumeric at both ends. Only `-`
+    // may follow the first character of a label.
+    let label_start <int> = at + 1;
+    let dot <int> = -1;
     for (let i <int> = at + 1; i < n; i++) {
-        if (!email_domain_char(cs[i])) {
+        if (cs[i] == '.') {
+            if (i == label_start || cs[i - 1] == '-' || i - label_start > 63) {
+                delete cs;
+                return false;
+            }
+            dot = i;
+            label_start = i + 1;
+        } else {
+            if (!email_domain_char(cs[i])) {
+                delete cs;
+                return false;
+            }
+            if (cs[i] == '-' && i == label_start) {
+                delete cs;
+                return false;
+            }
+        }
+    }
+    if (dot == -1 || n - dot - 1 < 2 || n - label_start > 63 || cs[n - 1] == '-') {
+        delete cs;
+        return false;
+    }
+    for (let i <int> = dot + 1; i < n; i++) {
+        if ((cs[i] < 'a' || cs[i] > 'z') && (cs[i] < 'A' || cs[i] > 'Z')) {
             delete cs;
             return false;
         }
@@ -288,53 +316,80 @@ priv fun push_error(r: &ValidationResult, f: &Field, tail: string) <noret> {
     append_error(r, new ValidationError{field: f.name, message: field_msg(f, tail), owns_message: true});
 }
 
+// Same, for a tail this module allocated: the message copies it, so free it here.
+priv fun push_error_owned(r: &ValidationResult, f: &Field, tail: string) <noret> {
+    push_error(r, f, tail);
+    free_str(tail);
+}
+
+// Messages name the rule and the numbers this module computed. They never echo
+// the untrusted input itself, which would let a CR/LF in a submitted value forge
+// log lines wherever the message is written.
 priv fun check_value(f: &Field, value: string, r: &ValidationResult) <noret> {
     if (f.ftype == 0) {
         let vlen <int> = len(value);
-        if (f.min_len >= 0 && vlen < f.min_len) { push_error(r, f, "is too short"); }
-        if (f.max_len >= 0 && vlen > f.max_len) { push_error(r, f, "is too long"); }
+        if (f.min_len >= 0 && vlen < f.min_len) {
+            push_error_owned(r, f, format!("is too short: {} bytes, minimum {}", vlen, f.min_len));
+        }
+        if (f.max_len >= 0 && vlen > f.max_len) {
+            push_error_owned(r, f, format!("is too long: {} bytes, maximum {}", vlen, f.max_len));
+        }
     }
     if (f.ftype == 4 && !valid_email(value)) {
-        push_error(r, f, "is not a valid email address");
+        push_error(r, f, "is not a valid email address: expected local@domain.tld, letters-only TLD of at least 2");
     }
     if (f.ftype == 1) {
         let p <IntParse> = try_parse_int(value);
         if (!p.ok) {
-            push_error(r, f, "must be an integer");
+            push_error(r, f, "must be an integer: optional minus, then decimal digits within int32");
         } else if (f.exact_int) {
-            if (f.has_min && p.value < f.min_int) { push_error(r, f, "is below the minimum"); }
-            if (f.has_max && p.value > f.max_int) { push_error(r, f, "is above the maximum"); }
+            if (f.has_min && p.value < f.min_int) {
+                push_error_owned(r, f, format!("is below the minimum: {}, minimum {}", p.value, f.min_int));
+            }
+            if (f.has_max && p.value > f.max_int) {
+                push_error_owned(r, f, format!("is above the maximum: {}, maximum {}", p.value, f.max_int));
+            }
         } else {
             // Promote both operands: every int32 and binary32 bound is exact
             // in double. Only the caller's float bound may already be rounded.
             let fv <double> = cast<double>(p.value);
-            if (f.has_min && fv < cast<double>(f.min_val)) { push_error(r, f, "is below the minimum"); }
-            if (f.has_max && fv > cast<double>(f.max_val)) { push_error(r, f, "is above the maximum"); }
+            if (f.has_min && fv < cast<double>(f.min_val)) {
+                push_error_owned(r, f, format!("is below the minimum: {}, minimum {}", p.value, f.min_val));
+            }
+            if (f.has_max && fv > cast<double>(f.max_val)) {
+                push_error_owned(r, f, format!("is above the maximum: {}, maximum {}", p.value, f.max_val));
+            }
         }
     }
     if (f.ftype == 2) {
         let p <FloatParse> = try_parse_float(value);
         if (!p.ok) {
-            push_error(r, f, "must be a number");
+            push_error(r, f, "must be a number: optional minus, decimal digits, at most one dot, finite binary32");
         } else {
-            if (f.has_min && p.value < f.min_val) { push_error(r, f, "is below the minimum"); }
-            if (f.has_max && p.value > f.max_val) { push_error(r, f, "is above the maximum"); }
+            if (f.has_min && p.value < f.min_val) {
+                push_error_owned(r, f, format!("is below the minimum: {}, minimum {}", p.value, f.min_val));
+            }
+            if (f.has_max && p.value > f.max_val) {
+                push_error_owned(r, f, format!("is above the maximum: {}, maximum {}", p.value, f.max_val));
+            }
         }
     }
     if (f.ftype == 3) {
         if (!str_eq(value, "true") && !str_eq(value, "false") && !str_eq(value, "1") && !str_eq(value, "0")) {
-            push_error(r, f, "must be a boolean (true/false/1/0)");
+            push_error(r, f, "must be a boolean: true, false, 1 or 0, lowercase");
         }
     }
     if (f.has_allowed) {
         let ok <bool> = false;
         // A null or empty configured allowlist permits no nonempty value.
+        let size <int> = 0;
         if (f.allowed != null) {
-            for (let i <int> = 0; i < f.allowed.len(); i++) {
+            size = f.allowed.len();
+            for (let i <int> = 0; i < size; i++) {
                 if (str_eq(value, f.allowed.get(i))) { ok = true; break; }
             }
         }
-        if (!ok) { push_error(r, f, "is not an allowed value"); }
+        if (!ok) { push_error_owned(r, f, format!("is not one of the {} allowed values", size)); }
     }
     if (f.has_custom) {
         let c <fn(string) -> bool> = f.custom;

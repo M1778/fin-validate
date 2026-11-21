@@ -1,7 +1,13 @@
 .finn/
+.finc/
 out/
 *.o
 *.obj
 *.exe
-test_crypto
+
+# Binaries the local test/example commands write next to the sources.
 basic
+test_validate
+test_boundaries
+test_reuse
+example_basic
