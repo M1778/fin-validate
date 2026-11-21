@@ -186,11 +186,11 @@ fun test_float_boundaries() <noret> {
     add_float_field(&s, "value", true, true, 1.0, true, 1.0);
     expect_value(&s, input, &r, exact, true, "4096 trailing fractional zeroes preserve one");
     expect_value(&s, input, &r, below, false, "long zero fraction cannot bypass minimum");
-    assert_true(equals(error_at(&r, 0).message, "field 'value' is below the minimum"), "long fraction minimum message");
+    assert_true(equals(error_at(&r, 0).message, "field 'value' is below the minimum: 0, minimum 1"), "long fraction minimum message");
     expect_value(&s, input, &r, above, false, "former NaN-producing input cannot bypass maximum");
-    assert_true(equals(error_at(&r, 0).message, "field 'value' is above the maximum"), "long fraction maximum message");
+    assert_true(equals(error_at(&r, 0).message, "field 'value' is above the maximum: 2, maximum 1"), "long fraction maximum message");
     expect_value(&s, input, &r, overflow, false, "overflow is invalid even with limits");
-    assert_true(equals(error_at(&r, 0).message, "field 'value' must be a number"), "overflow number message");
+    assert_true(equals(error_at(&r, 0).message, "field 'value' must be a number: optional minus, decimal digits, at most one dot, finite binary32"), "overflow number message");
     schema_clear(&s);
     add_float_field(&s, "value", true, true, -0.125, true, -0.125);
     let negative_fraction <string> = concat("-0.125", zeroes);
@@ -223,7 +223,7 @@ fun test_allowlist() <noret> {
     let allowed <&Collection<string>> = new Collection::<string>{};
     add_one_of_field(&s, "value", true, allowed);
     expect_value(&s, input, &r, "admin", false, "empty allowlist fails closed");
-    assert_true(equals(error_at(&r, 0).message, "field 'value' is not an allowed value"), "empty allowlist message");
+    assert_true(equals(error_at(&r, 0).message, "field 'value' is not one of the 0 allowed values"), "empty allowlist message");
     allowed.push("user");
     expect_value(&s, input, &r, "user", true, "allowlist is borrowed and observes changes");
     expect_value(&s, input, &r, "admin", false, "configured membership still enforced");
@@ -302,7 +302,7 @@ fun test_reuse_and_disposal() <noret> {
     schema_check_into(&s, input, &r);
     assert_true(!r.ok && error_count(&r) == 1, "disposed handles support reuse");
     schema_dispose(&s);
-    assert_true(equals(error_at(&r, 0).message, "field 'value' is too short"), "generated message survives schema disposal");
+    assert_true(equals(error_at(&r, 0).message, "field 'value' is too short: 1 bytes, minimum 5"), "generated message survives schema disposal");
     result_dispose(&r);
     input_clear(input);
     delete input;
@@ -336,42 +336,42 @@ fun main() <noret> {
     input_set(i3, "email", "not-an-email");
     let r3 <ValidationResult> = schema_check(&s, i3);
     assert_true(!r3.ok, "bad email should fail");
-    assert_true(equals(error_at(&r3, 0).message, "field 'email' is not a valid email address"), "email message");
+    assert_true(equals(error_at(&r3, 0).message, "field 'email' is not a valid email address: expected local@domain.tld, letters-only TLD of at least 2"), "email message");
 
     // 4. age above maximum
     let i4 <&Collection<&InputValue>> = valid_input();
     input_set(i4, "age", "999");
     let r4 <ValidationResult> = schema_check(&s, i4);
     assert_true(!r4.ok, "age 999 should fail");
-    assert_true(equals(error_at(&r4, 0).message, "field 'age' is above the maximum"), "max message");
+    assert_true(equals(error_at(&r4, 0).message, "field 'age' is above the maximum: 999, maximum 150"), "max message");
 
     // 5. age not a number
     let i5 <&Collection<&InputValue>> = valid_input();
     input_set(i5, "age", "abc");
     let r5 <ValidationResult> = schema_check(&s, i5);
     assert_true(!r5.ok, "age 'abc' should fail");
-    assert_true(equals(error_at(&r5, 0).message, "field 'age' must be an integer"), "int message");
+    assert_true(equals(error_at(&r5, 0).message, "field 'age' must be an integer: optional minus, then decimal digits within int32"), "int message");
 
     // 6. integer overflow must NOT abort — it is a validation error
     let i6 <&Collection<&InputValue>> = valid_input();
     input_set(i6, "age", "2147483648");
     let r6 <ValidationResult> = schema_check(&s, i6);
     assert_true(!r6.ok, "age overflow should fail gracefully");
-    assert_true(equals(error_at(&r6, 0).message, "field 'age' must be an integer"), "overflow message");
+    assert_true(equals(error_at(&r6, 0).message, "field 'age' must be an integer: optional minus, then decimal digits within int32"), "overflow message");
 
     // 7. disallowed role
     let i7 <&Collection<&InputValue>> = valid_input();
     input_set(i7, "role", "superuser");
     let r7 <ValidationResult> = schema_check(&s, i7);
     assert_true(!r7.ok, "bad role should fail");
-    assert_true(equals(error_at(&r7, 0).message, "field 'role' is not an allowed value"), "one_of message");
+    assert_true(equals(error_at(&r7, 0).message, "field 'role' is not one of the 2 allowed values"), "one_of message");
 
     // 8. username too short
     let i8 <&Collection<&InputValue>> = valid_input();
     input_set(i8, "username", "ab");
     let r8 <ValidationResult> = schema_check(&s, i8);
     assert_true(!r8.ok, "short username should fail");
-    assert_true(equals(error_at(&r8, 0).message, "field 'username' is too short"), "min_len message");
+    assert_true(equals(error_at(&r8, 0).message, "field 'username' is too short: 2 bytes, minimum 3"), "min_len message");
 
     // 8b. username too long, and the exact boundary on both sides.
     //
